@@ -187,3 +187,71 @@ cd costSensitive
 python inference.py
 ```
 
+---
+
+## 9. 单机实时流量分析（纯单线程）
+
+本仓库已新增实时管线入口：`costSensitive/main_realtime.py`。
+
+> 当前入口为**纯单线程/单进程**执行，已移除实时链路中的多进程实现。
+
+### 9.1 安装实时依赖
+
+```powershell
+pip install scapy
+```
+
+> Windows 实时抓包需要 Npcap 与管理员权限。若暂时没有抓包权限，可先用 pcap 回放模式验证。
+
+### 9.2 pcap 回放模式
+
+```powershell
+cd costSensitive
+python main_realtime.py --mode pcap --source dataset/iscx --model-path pytorch_model/convnet.pth --label-map processed_full/mnist/label_map.json --output-dir pytorch_model/realtime
+```
+
+### 9.3 live 实时监测模式（单线程）
+
+`live` 已支持，且为单线程（Scapy 抓包 + 流重组 + 推理 + 落盘同线程执行）。
+
+Windows 下 `--source` 建议使用 Npcap 设备名（如 `\Device\NPF_{...}`），可先执行：
+
+```powershell
+cd costSensitive
+python realtime\list_npcap_ifaces.py
+```
+
+再启动实时监测（示例运行 60 秒后自动结束）：
+
+```powershell
+cd costSensitive
+python main_realtime.py --mode live --source "\Device\NPF_{94B4B764-8E09-485A-9EF1-10C26641DF79}" --model-path pytorch_model/convnet.pth --label-map processed_full/mnist/label_map.json --output-dir pytorch_model/realtime_live_single --batch-size 16 --batch-wait-ms 20 --device cpu --live-duration-seconds 60
+```
+
+### 9.4 关键参数
+
+- `--batch-size`：批推理大小（默认 64）
+- `--batch-wait-ms`：最长聚合等待（默认 50ms）
+- `--flow-timeout-s`：流超时触发补零（默认 10s）
+- `--max-active-flows`：活动流上限（默认 50000）
+- `--live-duration-seconds`：live 模式运行时长（秒），0 表示持续运行直到 `Ctrl+C`
+
+### 9.5 输出文件
+
+- `pytorch_model/realtime/realtime_predictions.csv`
+- `pytorch_model/realtime/realtime_predictions.jsonl`
+
+包含字段：`sample_id`、`flow_key`、`trigger(length/timeout/fin_rst)`、`pred`、`pred_name`、`confidence`、`end2end_ms`。
+
+### 9.6 live 运行日志说明
+
+`live` 模式会周期打印心跳统计：
+
+- `packets_total`：收到的包数
+- `parsed`：成功解析为 TCP/UDP 事件的包数
+- `dropped`：解析失败或被过滤的包数
+- `samples_total`：触发出的 784 样本数
+- `trigger(length/timeout/fin)`：三类触发计数
+
+若 `packets_total > 0` 但 `parsed` 很低，通常是接口选错或抓到大量非 TCP/UDP 流量。
+
