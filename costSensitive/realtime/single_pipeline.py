@@ -83,6 +83,10 @@ class SinglePipelineRunner:
         output_csv: str,
         output_jsonl: str,
         device: Optional[str] = None,
+        unknown_enable: bool = False,
+        unknown_detector_path: Optional[str] = None,
+        unknown_threshold_conf: Optional[float] = None,
+        unknown_threshold_anom: Optional[float] = None,
     ):
         import torch
         import torch.nn.functional as F
@@ -103,6 +107,15 @@ class SinglePipelineRunner:
             self._torch.load(model_path, map_location=self.device)
         )
         self.model.eval()
+
+        self.unknown_enable = bool(unknown_enable)
+        self.unknown_detector_path = unknown_detector_path
+        self.unknown_tau1 = unknown_threshold_conf
+        self.unknown_tau2 = unknown_threshold_anom
+        self.unknown_detector_name = None
+        self.unknown_per_class_detectors = None
+        self.unknown_global_detector = None
+        self._load_unknown_detector()
 
         self.label_map = self._load_label_map(label_map_path)
 
@@ -126,6 +139,59 @@ class SinglePipelineRunner:
             "other": 0,
         }
         self.last_heartbeat = time.time()
+
+    def _load_unknown_detector(self):
+        if not self.unknown_enable:
+            return
+
+        if self.unknown_detector_path and os.path.exists(self.unknown_detector_path):
+            try:
+                import joblib
+
+                payload = joblib.load(self.unknown_detector_path)
+                self.unknown_detector_name = payload.get("detector_name")
+                self.unknown_per_class_detectors = payload.get("per_class_detectors")
+                self.unknown_global_detector = payload.get("global_detector")
+
+                thresholds = payload.get("thresholds", {})
+                if self.unknown_tau1 is None:
+                    self.unknown_tau1 = thresholds.get("tau1")
+                if self.unknown_tau2 is None:
+                    self.unknown_tau2 = thresholds.get("tau2")
+            except Exception as exc:
+                print(f"[WARN] unknown检测器加载失败: {exc}")
+
+        if self.unknown_tau1 is None:
+            print("[WARN] unknown_enable已开启，但tau1缺失，降级为仅分类输出")
+            self.unknown_enable = False
+            return
+
+        print(
+            "[UNKNOWN] enabled=1 detector={} tau1={} tau2={}".format(
+                self.unknown_detector_name,
+                self.unknown_tau1,
+                self.unknown_tau2,
+            )
+        )
+
+    def _score_anomaly_batch(self, features, pred):
+        if (
+            self.unknown_per_class_detectors is None
+            or self.unknown_global_detector is None
+            or self.unknown_tau2 is None
+        ):
+            return np.full((features.shape[0],), np.nan, dtype=np.float32)
+
+        feat_np = features.detach().cpu().numpy()
+        pred_np = pred.detach().cpu().numpy()
+        scores = np.zeros((feat_np.shape[0],), dtype=np.float32)
+        for i in range(feat_np.shape[0]):
+            class_id = int(pred_np[i])
+            detector = self.unknown_per_class_detectors.get(
+                class_id, self.unknown_global_detector
+            )
+            scores[i] = float(detector.decision_function(feat_np[i : i + 1])[0])
+        return scores
 
     def _load_label_map(self, path: Optional[str]) -> Dict[int, str]:
         if not path or not os.path.exists(path):
@@ -174,13 +240,41 @@ class SinglePipelineRunner:
 
         with self._torch.no_grad():
             x = self._batch_to_tensor()
-            logits = self.model(x)
+            logits, features = self.model(x, return_features=True)
             probs = self._F.softmax(logits, dim=1)
             conf, pred = probs.max(dim=1)
+
+        anomaly_scores = np.full((len(self.batch),), np.nan, dtype=np.float32)
+        if self.unknown_enable:
+            anomaly_scores = self._score_anomaly_batch(features, pred)
 
         infer_ts = time.time()
         for i, item in enumerate(self.batch):
             pred_id = int(pred[i].item())
+            confidence = float(conf[i].item())
+
+            low_conf = bool(
+                self.unknown_enable and confidence < float(self.unknown_tau1)
+            )
+            high_anom = bool(
+                self.unknown_enable
+                and self.unknown_tau2 is not None
+                and np.isfinite(anomaly_scores[i])
+                and anomaly_scores[i] > float(self.unknown_tau2)
+            )
+
+            is_unknown = bool(low_conf or high_anom)
+            if not self.unknown_enable:
+                unknown_reason = "unknown_disabled"
+            elif low_conf and high_anom:
+                unknown_reason = "low_confidence_and_high_anomaly"
+            elif low_conf:
+                unknown_reason = "low_confidence"
+            elif high_anom:
+                unknown_reason = "high_anomaly"
+            else:
+                unknown_reason = "known"
+
             record = {
                 "sample_id": item["sample_id"],
                 "flow_key": item["flow_key"],
@@ -191,7 +285,12 @@ class SinglePipelineRunner:
                 "end2end_ms": (infer_ts - item["enqueue_ts"]) * 1000.0,
                 "pred": pred_id,
                 "pred_name": self.label_map.get(pred_id, str(pred_id)),
-                "confidence": float(conf[i].item()),
+                "confidence": confidence,
+                "anomaly_score": (
+                    float(anomaly_scores[i]) if np.isfinite(anomaly_scores[i]) else None
+                ),
+                "is_unknown": int(is_unknown),
+                "unknown_reason": unknown_reason,
             }
 
             writer.writerow(
@@ -206,6 +305,13 @@ class SinglePipelineRunner:
                     record["pred"],
                     record["pred_name"],
                     f"{record['confidence']:.6f}",
+                    (
+                        f"{record['anomaly_score']:.6f}"
+                        if record["anomaly_score"] is not None
+                        else ""
+                    ),
+                    record["is_unknown"],
+                    record["unknown_reason"],
                 ]
             )
             jsonf.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -279,6 +385,9 @@ class SinglePipelineRunner:
                     "pred",
                     "pred_name",
                     "confidence",
+                    "anomaly_score",
+                    "is_unknown",
+                    "unknown_reason",
                 ]
             )
 
@@ -356,6 +465,9 @@ class SinglePipelineRunner:
                     "pred",
                     "pred_name",
                     "confidence",
+                    "anomaly_score",
+                    "is_unknown",
+                    "unknown_reason",
                 ]
             )
 
@@ -424,6 +536,10 @@ def run_single_pipeline(
     output_dir: str,
     device: Optional[str] = None,
     live_duration_seconds: float = 0.0,
+    unknown_enable: bool = False,
+    unknown_detector_path: Optional[str] = None,
+    unknown_threshold_conf: Optional[float] = None,
+    unknown_threshold_anom: Optional[float] = None,
 ):
     output_csv = os.path.join(output_dir, "realtime_predictions.csv")
     output_jsonl = os.path.join(output_dir, "realtime_predictions.jsonl")
@@ -435,6 +551,10 @@ def run_single_pipeline(
         output_csv=output_csv,
         output_jsonl=output_jsonl,
         device=device,
+        unknown_enable=unknown_enable,
+        unknown_detector_path=unknown_detector_path,
+        unknown_threshold_conf=unknown_threshold_conf,
+        unknown_threshold_anom=unknown_threshold_anom,
     )
 
     if mode == "pcap":

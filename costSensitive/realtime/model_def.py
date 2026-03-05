@@ -36,12 +36,18 @@ class ConvNet(nn.Module):
         )
         self.fc = nn.Linear(256, NUM_CLASSES)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
         x = self.classifier(x)
         x = x.view(x.size(0), -1)
-        x = self.fc(x)
         return x
+
+    def forward(self, x: torch.Tensor, return_features: bool = False):
+        features = self.forward_features(x)
+        logits = self.fc(features)
+        if return_features:
+            return logits, features
+        return logits

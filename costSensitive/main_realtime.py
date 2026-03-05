@@ -31,6 +31,28 @@ def parse_args():
         default=os.path.join("pytorch_model", "realtime"),
         help="推理结果输出目录",
     )
+    parser.add_argument(
+        "--unknown-enable",
+        action="store_true",
+        help="启用未知流量检测（MSP + 可选PyOD）",
+    )
+    parser.add_argument(
+        "--unknown-detector-path",
+        default=os.path.join("pytorch_model", "unknown_detector_best.pkl"),
+        help="unknown检测器路径（inference.py 导出的 pkl）",
+    )
+    parser.add_argument(
+        "--unknown-threshold-conf",
+        type=float,
+        default=None,
+        help="MSP阈值tau1，confidence < tau1 判定为未知",
+    )
+    parser.add_argument(
+        "--unknown-threshold-anom",
+        type=float,
+        default=None,
+        help="异常分数阈值tau2，anomaly_score > tau2 判定为未知",
+    )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--batch-wait-ms", type=int, default=50)
     parser.add_argument("--flow-timeout-s", type=float, default=10.0)
@@ -74,6 +96,10 @@ def main():
         output_dir=args.output_dir,
         device=args.device,
         live_duration_seconds=args.live_duration_seconds,
+        unknown_enable=args.unknown_enable,
+        unknown_detector_path=args.unknown_detector_path,
+        unknown_threshold_conf=args.unknown_threshold_conf,
+        unknown_threshold_anom=args.unknown_threshold_anom,
     )
 
 
