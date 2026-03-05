@@ -1,0 +1,1 @@
+"""NetGuard frontend UI package."""
