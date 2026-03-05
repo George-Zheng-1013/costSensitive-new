@@ -168,6 +168,13 @@ class SinglePipelineRunner:
         self.last_heartbeat = time.time()
 
     def _load_unknown_detector(self):
+        def _to_finite_or_nan(value) -> float:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return float("nan")
+            return parsed if math.isfinite(parsed) else float("nan")
+
         if not self.unknown_enable:
             return
 
@@ -182,19 +189,27 @@ class SinglePipelineRunner:
 
                 thresholds = payload.get("thresholds", {})
                 if not math.isfinite(self.unknown_tau1):
-                    self.unknown_tau1 = thresholds.get("tau1")
+                    self.unknown_tau1 = _to_finite_or_nan(thresholds.get("tau1"))
                 if not math.isfinite(self.unknown_tau2):
-                    self.unknown_tau2 = thresholds.get("tau2")
+                    self.unknown_tau2 = _to_finite_or_nan(thresholds.get("tau2"))
 
                 risk_payload = payload.get("risk", {})
                 if not self._risk_alpha_overridden:
-                    self.risk_alpha = risk_payload.get("alpha")
+                    alpha_loaded = _to_finite_or_nan(risk_payload.get("alpha"))
+                    if math.isfinite(alpha_loaded):
+                        self.risk_alpha = alpha_loaded
                 if not math.isfinite(self.alert_threshold):
-                    self.alert_threshold = thresholds.get("alert_threshold")
+                    self.alert_threshold = _to_finite_or_nan(
+                        thresholds.get("alert_threshold")
+                    )
                 if not math.isfinite(self.medium_threshold):
-                    self.medium_threshold = thresholds.get("medium_threshold")
+                    self.medium_threshold = _to_finite_or_nan(
+                        thresholds.get("medium_threshold")
+                    )
                 if not math.isfinite(self.high_threshold):
-                    self.high_threshold = thresholds.get("high_threshold")
+                    self.high_threshold = _to_finite_or_nan(
+                        thresholds.get("high_threshold")
+                    )
 
                 normalization = risk_payload.get("normalization", {})
                 self.anom_q05 = normalization.get("anomaly_q05")
@@ -207,6 +222,7 @@ class SinglePipelineRunner:
             self.unknown_enable = False
             return
 
+        self.risk_alpha = _to_finite_or_nan(self.risk_alpha)
         if not math.isfinite(self.risk_alpha):
             self.risk_alpha = 0.5
         self.risk_alpha = float(np.clip(self.risk_alpha, 0.0, 1.0))
@@ -244,7 +260,7 @@ class SinglePipelineRunner:
             value = (float(score) - float(self.anom_q05)) / denom
             return float(np.clip(value, 0.0, 1.0))
 
-        if self.unknown_tau2 is not None:
+        if self.unknown_tau2 is not None and math.isfinite(float(self.unknown_tau2)):
             return float(1.0 if float(score) > float(self.unknown_tau2) else 0.0)
         return None
 

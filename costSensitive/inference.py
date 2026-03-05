@@ -490,16 +490,21 @@ def optimize_three_level_thresholds(
             "mode": "known_only_quantile",
         }
 
-    candidates = np.unique(
-        np.concatenate(
-            [
-                known_risk,
-                ood_risk,
-                np.array([0.0, 1.0], dtype=np.float32),
-            ],
-            axis=0,
-        )
+    merged = np.concatenate(
+        [
+            known_risk,
+            ood_risk,
+            np.array([0.0, 1.0], dtype=np.float32),
+        ],
+        axis=0,
     )
+    unique_all = np.unique(merged)
+    if unique_all.size <= 400:
+        candidates = unique_all
+    else:
+        quantiles = np.linspace(0.0, 1.0, 201)
+        candidates = np.unique(np.quantile(merged, quantiles))
+
     best = None
     for t_medium in candidates:
         for t_high in candidates:

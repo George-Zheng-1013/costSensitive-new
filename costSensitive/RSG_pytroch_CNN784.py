@@ -87,7 +87,7 @@ testDataset = DealDataset(
 train_loader = torch.utils.data.DataLoader(
     dataset=trainDataset,
     batch_size=100,  # 一个批次可以认为是一个包，每个包中含有10张图片
-    shuffle=False,
+    shuffle=True,
 )
 
 # test数据装载
@@ -161,12 +161,8 @@ class ConvNet(nn.Module):
         self, x
     ):  # 该函数专门用于提取卷积神经网络的特征图的功能，返回feature_map1, feature_map2为前两层卷积层的特征图
 
-        feature_map1 = F.relu(self.conv1(x))  # 完成第一层卷积
-        x = self.pool(feature_map1)  # 完成第一层pooling
-        print("type(feature_map1)=", feature_map1)
-        feature_map2 = F.relu(
-            self.conv2(x)
-        )  # 第二层卷积，两层特征图都存储到了feature_map1, feature_map2中
+        feature_map1 = self.layer1(x)
+        feature_map2 = self.layer2(feature_map1)
         return (feature_map1, feature_map2)
 
     def setTrainFlag(self):

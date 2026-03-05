@@ -194,9 +194,9 @@ def iter_capture_samples(capture_path):
                 payload_all.extend(payload)
                 payload_all.extend(b"\x00" * PAD_LEN)
 
-                if len(payload_all) > PACKET_LEN:
+                while len(payload_all) >= PACKET_LEN:
                     sample = bytes(payload_all[:PACKET_LEN])
-                    payload_all = bytearray()
+                    del payload_all[:PACKET_LEN]
                     yield ts, sample
             except Exception:
                 continue
