@@ -6,3 +6,4 @@ numpy>=1.26
 torch>=2.2
 dpkt>=1.9
 scapy>=2.5
+openai>=1.51

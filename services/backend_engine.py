@@ -6,7 +6,10 @@ import subprocess
 import sys
 import time
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+
+from services.ai_analyst import TrafficAIAnalyst
+from services.ai_config import AIConfig
 
 try:
     import sqlite3
@@ -19,6 +22,7 @@ except ImportError as exc:
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(PROJECT_ROOT, "netguard_logs.db")
 TABLE_NAME = "traffic_alerts"
+AI_TABLE_NAME = "ai_insights"
 
 REALTIME_JSONL = os.path.join(
     PROJECT_ROOT,
@@ -71,6 +75,31 @@ def init_db(db_path: str) -> None:
         if col not in existing_cols:
             cursor.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN {col} {col_type}")
 
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {AI_TABLE_NAME} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            insight_type TEXT NOT NULL DEFAULT 'alert',
+            sample_size INTEGER NOT NULL,
+            scene TEXT,
+            risk_level TEXT,
+            summary TEXT,
+            actions_json TEXT,
+            next_checks_json TEXT,
+            confidence REAL,
+            raw_json TEXT
+        )
+        """
+    )
+
+    cursor.execute(f"PRAGMA table_info({AI_TABLE_NAME})")
+    ai_cols = {row[1] for row in cursor.fetchall()}
+    if "insight_type" not in ai_cols:
+        cursor.execute(
+            f"ALTER TABLE {AI_TABLE_NAME} ADD COLUMN insight_type TEXT NOT NULL DEFAULT 'alert'"
+        )
+
     conn.commit()
     conn.close()
 
@@ -79,8 +108,133 @@ def clear_table(db_path: str) -> None:
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute(f"DELETE FROM {TABLE_NAME}")
+    cursor.execute(f"DELETE FROM {AI_TABLE_NAME}")
     conn.commit()
     conn.close()
+
+
+def query_recent_alert_rows(
+    conn: sqlite3.Connection,
+    limit: int,
+) -> List[Dict]:
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT timestamp, src_ip, dst_ip, protocol, threat_category,
+               confidence, risk_score, alert_level, explain_reason
+        FROM {TABLE_NAME}
+        WHERE alert_level IN ('medium', 'high')
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    )
+    rows = cursor.fetchall()
+    out: List[Dict] = []
+    for r in rows:
+        out.append(
+            {
+                "timestamp": r[0],
+                "src_ip": r[1],
+                "dst_ip": r[2],
+                "protocol": r[3],
+                "threat_category": r[4],
+                "confidence": r[5],
+                "risk_score": r[6],
+                "alert_level": r[7],
+                "explain_reason": r[8],
+            }
+        )
+    return out
+
+
+def query_recent_known_rows(
+    conn: sqlite3.Connection,
+    limit: int,
+) -> List[Dict]:
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT timestamp, src_ip, dst_ip, protocol, threat_category,
+               confidence, risk_score, alert_level, explain_reason
+        FROM {TABLE_NAME}
+        WHERE threat_category != 'unknown_proxy_ood'
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    )
+    rows = cursor.fetchall()
+    out: List[Dict] = []
+    for r in rows:
+        out.append(
+            {
+                "timestamp": r[0],
+                "src_ip": r[1],
+                "dst_ip": r[2],
+                "protocol": r[3],
+                "threat_category": r[4],
+                "confidence": r[5],
+                "risk_score": r[6],
+                "alert_level": r[7],
+                "explain_reason": r[8],
+            }
+        )
+    return out
+
+
+def insert_ai_insight(
+    conn: sqlite3.Connection,
+    payload: Dict,
+    sample_size: int,
+    insight_type: str = "alert",
+) -> None:
+    scene = str(payload.get("scene", ""))[:300]
+    risk_level = str(payload.get("risk_level", ""))[:50]
+    summary = str(payload.get("summary", ""))[:2000]
+    actions = payload.get("actions")
+    if actions is None:
+        actions = payload.get("recommendations", [])
+    next_checks = payload.get("next_checks")
+    if next_checks is None:
+        next_checks = payload.get("suspicious_patterns", [])
+    try:
+        confidence = float(payload.get("confidence", 0.0))
+    except Exception:
+        confidence = 0.0
+
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        INSERT INTO {AI_TABLE_NAME}
+        (
+            created_at,
+            insight_type,
+            sample_size,
+            scene,
+            risk_level,
+            summary,
+            actions_json,
+            next_checks_json,
+            confidence,
+            raw_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            str(insight_type),
+            int(sample_size),
+            scene,
+            risk_level,
+            summary,
+            json.dumps(actions, ensure_ascii=False),
+            json.dumps(next_checks, ensure_ascii=False),
+            confidence,
+            json.dumps(payload, ensure_ascii=False),
+        ),
+    )
+    conn.commit()
 
 
 def protocol_name(proto_num: int) -> str:
@@ -304,11 +458,28 @@ def consume_jsonl_forever(
     db_path: str,
     poll_s: float = 1.0,
     from_start: bool = False,
+    ai_enabled_override: Optional[bool] = None,
 ) -> None:
     init_db(db_path)
     conn = sqlite3.connect(db_path)
+    ai_cfg = AIConfig.from_env()
+    if ai_enabled_override is not None:
+        ai_cfg.enabled = bool(ai_enabled_override)
+    analyst = TrafficAIAnalyst(ai_cfg)
 
     print("=" * 92)
+
+    if ai_cfg.enabled:
+        if analyst.available:
+            print(
+                "[NetGuard Engine] AI analysis enabled "
+                f"(model={ai_cfg.model}, every_n={ai_cfg.analyze_every_n}, window={ai_cfg.window_size})"
+            )
+        else:
+            print(
+                "[NetGuard Engine] AI enabled but unavailable "
+                "(missing api key/openai package or client init failed)."
+            )
     print(f"[NetGuard Engine] SQLite writer started -> {db_path}")
     print(f"[NetGuard Engine] source realtime jsonl -> {jsonl_path}")
     print("[NetGuard Engine] mode: live model output -> sqlite dashboard table")
@@ -357,6 +528,48 @@ def consume_jsonl_forever(
                         inserted += 1
                         if inserted % 20 == 0:
                             print(f"[NetGuard Engine] inserted={inserted}")
+
+                        if (
+                            analyst.available
+                            and inserted > 0
+                            and inserted % ai_cfg.analyze_every_n == 0
+                        ):
+                            recent = query_recent_alert_rows(conn, ai_cfg.window_size)
+                            if len(recent) > 0:
+                                ai_result = analyst.analyze_alerts(recent)
+                                if isinstance(ai_result, dict) and len(ai_result) > 0:
+                                    insert_ai_insight(
+                                        conn,
+                                        payload=ai_result,
+                                        sample_size=len(recent),
+                                        insight_type="alert",
+                                    )
+                                    print(
+                                        "[NetGuard Engine] ai_insight inserted "
+                                        f"(type=alert, sample_size={len(recent)})"
+                                    )
+
+                            known_recent = query_recent_known_rows(
+                                conn, ai_cfg.window_size
+                            )
+                            if len(known_recent) > 0:
+                                behavior_result = analyst.analyze_known_behavior(
+                                    known_recent
+                                )
+                                if (
+                                    isinstance(behavior_result, dict)
+                                    and len(behavior_result) > 0
+                                ):
+                                    insert_ai_insight(
+                                        conn,
+                                        payload=behavior_result,
+                                        sample_size=len(known_recent),
+                                        insight_type="behavior",
+                                    )
+                                    print(
+                                        "[NetGuard Engine] ai_insight inserted "
+                                        f"(type=behavior, sample_size={len(known_recent)})"
+                                    )
                     except Exception as exc:
                         print(f"[WARN] skip malformed record: {exc}")
                 file_pos = f.tell()
@@ -416,6 +629,16 @@ def parse_args():
         default=None,
         help="device for costSensitive/main_realtime.py --device (cpu/cuda)",
     )
+    parser.add_argument(
+        "--ai-enabled",
+        action="store_true",
+        help="force enable AI analysis (overrides config/env)",
+    )
+    parser.add_argument(
+        "--no-ai",
+        action="store_true",
+        help="force disable AI analysis (overrides config/env)",
+    )
     return parser.parse_args()
 
 
@@ -463,11 +686,18 @@ def main() -> None:
         print(f"[NetGuard Engine] capture process started pid={capture_proc.pid}")
 
     try:
+        ai_override: Optional[bool] = None
+        if args.ai_enabled:
+            ai_override = True
+        if args.no_ai:
+            ai_override = False
+
         consume_jsonl_forever(
             jsonl_path=args.jsonl,
             db_path=args.db_path,
             poll_s=args.poll_s,
             from_start=args.from_start,
+            ai_enabled_override=ai_override,
         )
     finally:
         if capture_proc is not None and capture_proc.poll() is None:
