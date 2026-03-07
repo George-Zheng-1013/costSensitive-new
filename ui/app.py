@@ -1,4 +1,5 @@
-﻿import os
+﻿import json
+import os
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -179,6 +180,10 @@ ALERT_COLUMNS = [
     "confidence",
     "risk_score",
     "alert_level",
+    "centroid_distance",
+    "centroid_threshold",
+    "explain_reason",
+    "evidence_json",
 ]
 
 REAL_CLASS_NAMES = [
@@ -215,23 +220,41 @@ def load_db_table(db_path: str) -> pd.DataFrame:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
         df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce").fillna(0.0)
         df["risk_score"] = pd.to_numeric(df["risk_score"], errors="coerce").fillna(0.0)
+        df["centroid_distance"] = pd.to_numeric(
+            df.get("centroid_distance", 0.0), errors="coerce"
+        ).fillna(0.0)
+        df["centroid_threshold"] = pd.to_numeric(
+            df.get("centroid_threshold", 0.0), errors="coerce"
+        ).fillna(0.0)
+        if "explain_reason" not in df.columns:
+            df["explain_reason"] = ""
+        if "evidence_json" not in df.columns:
+            df["evidence_json"] = ""
     return df
 
 
 @st.cache_data(ttl=10)
 def load_unknown_report() -> dict:
-    report_path = os.path.join(
+    new_report_path = os.path.join(
+        PROJECT_ROOT,
+        "costSensitive",
+        "pytorch_model",
+        "session_eval_report.json",
+    )
+    old_report_path = os.path.join(
         PROJECT_ROOT,
         "costSensitive",
         "pytorch_model",
         "unknown_eval_report.json",
     )
-    if not os.path.exists(report_path):
-        return {}
-    try:
-        return pd.read_json(report_path, typ="series").to_dict()
-    except Exception:
-        return {}
+    for report_path in [new_report_path, old_report_path]:
+        if not os.path.exists(report_path):
+            continue
+        try:
+            return pd.read_json(report_path, typ="series").to_dict()
+        except Exception:
+            continue
+    return {}
 
 
 def build_hourly_trend(df: pd.DataFrame) -> pd.DataFrame:
@@ -274,8 +297,12 @@ def top5_attack_ips(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_metrics(report: dict) -> pd.DataFrame:
-    cls_acc = float(report.get("classification_accuracy", 0.57)) * 100
-    unknown_rate = float(report.get("test_unknown_rate", 0.16)) * 100
+    cls_acc = (
+        float(report.get("accuracy", report.get("classification_accuracy", 0.57))) * 100
+    )
+    unknown_rate = (
+        float(report.get("unknown_rate", report.get("test_unknown_rate", 0.16))) * 100
+    )
     return pd.DataFrame(
         {
             "metric": ["Accuracy", "Precision", "Recall", "F1", "Cost Utility"],
@@ -316,7 +343,7 @@ st.markdown(
     """
     <div class="hero">
         <p class="hero-title">NetGuard Cyber Command Deck</p>
-        <div class="hero-sub">1D-CNN + Unknown/Risk 联动检测 | 深色高对比可视化 | 挑战杯答辩展示模式</div>
+        <div class="hero-sub">Byte-Session Encoder + Unknown/Risk 联动检测 | 深色高对比可视化 | 挑战杯答辩展示模式</div>
         <div class="badge-row">
             <span class="badge">实时推理流</span>
             <span class="badge">SQLite 前后端解耦</span>
@@ -329,16 +356,16 @@ st.markdown(
 )
 
 with st.expander("模型链路说明", expanded=False):
-    st.markdown(
-        "- 主结构: `realtime/model_def.py` 与 `RSG_pytroch_CNN784.py` 的 1D-CNN 主干"
-    )
-    st.markdown("- 输入规格: 报文切片 `PACKET_LEN=784`，映射到 `28x28` 特征")
+    st.markdown("- 主结构: `PacketEncoder + SessionEncoder(BiGRU) + Embedding Head`")
+    st.markdown("- 输入规格: `num_packets=12`, `packet_len=256`, `packet_mask`")
     st.markdown("- 标签体系: 12 类业务标签 + `unknown_proxy_ood`")
     if report:
+        acc = float(report.get("accuracy", report.get("classification_accuracy", 0.0)))
+        u_rate = float(report.get("unknown_rate", report.get("test_unknown_rate", 0.0)))
         st.markdown(
-            f"- 当前报告: `classification_accuracy={float(report.get('classification_accuracy', 0.0)):.4f}`，"
-            f"`test_unknown_rate={float(report.get('test_unknown_rate', 0.0)):.2%}`，"
-            f"`selected_detector={report.get('selected_detector', 'N/A')}`"
+            f"- 当前报告: `accuracy={acc:.4f}`，"
+            f"`unknown_rate={u_rate:.2%}`，"
+            f"`detector_enabled={report.get('detector_enabled', 'N/A')}`"
         )
 
 
@@ -491,31 +518,94 @@ if page == "实时监控大屏":
         if db_df.empty:
             st.warning("数据库为空，请先运行 `python services/backend_engine.py`。")
         else:
-            high_logs = (
-                db_df[db_df["alert_level"].isin(["medium", "high"])].head(12).copy()
-            )
-            high_logs["timestamp"] = high_logs["timestamp"].dt.strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-            high_logs["confidence"] = high_logs["confidence"].map(lambda x: f"{x:.4f}")
-            high_logs["risk_score"] = high_logs["risk_score"].map(lambda x: f"{x:.4f}")
-            st.dataframe(
-                high_logs[
-                    [
-                        "timestamp",
-                        "src_ip",
-                        "dst_ip",
-                        "protocol",
-                        "threat_category",
-                        "confidence",
-                        "risk_score",
-                        "alert_level",
-                    ]
-                ],
-                width="stretch",
-                hide_index=True,
-                height=430,
-            )
+            st.caption("选择要展示的告警等级")
+            f1, f2, f3 = st.columns(3)
+            with f1:
+                show_low = st.checkbox("low", value=False, key="filter_low")
+            with f2:
+                show_medium = st.checkbox("medium", value=True, key="filter_medium")
+            with f3:
+                show_high = st.checkbox("high", value=True, key="filter_high")
+
+            selected_levels = []
+            if show_low:
+                selected_levels.append("low")
+            if show_medium:
+                selected_levels.append("medium")
+            if show_high:
+                selected_levels.append("high")
+
+            if len(selected_levels) == 0:
+                st.info("请至少选择一个告警等级。")
+            else:
+                high_logs = (
+                    db_df[db_df["alert_level"].isin(selected_levels)].head(12).copy()
+                )
+                if high_logs.empty:
+                    st.info("当前筛选条件下暂无告警记录。")
+                else:
+                    high_logs["timestamp"] = high_logs["timestamp"].dt.strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                    high_logs["confidence"] = high_logs["confidence"].map(
+                        lambda x: f"{x:.4f}"
+                    )
+                    high_logs["risk_score"] = high_logs["risk_score"].map(
+                        lambda x: f"{x:.4f}"
+                    )
+                    st.dataframe(
+                        high_logs[
+                            [
+                                "timestamp",
+                                "src_ip",
+                                "dst_ip",
+                                "protocol",
+                                "threat_category",
+                                "confidence",
+                                "risk_score",
+                                "alert_level",
+                            ]
+                        ],
+                        width="stretch",
+                        hide_index=True,
+                        height=430,
+                    )
+
+                    st.markdown(
+                        '<div class="section-title">告警解释与阈值证据</div>',
+                        unsafe_allow_html=True,
+                    )
+                    explain_rows = high_logs.head(3).copy()
+                    for _, row in explain_rows.iterrows():
+                        title = (
+                            f"{row['timestamp']} | {row['src_ip']} -> {row['dst_ip']} "
+                            f"| {row['threat_category']} | level={row['alert_level']}"
+                        )
+                        with st.expander(title, expanded=False):
+                            reason = str(row.get("explain_reason", "")).strip()
+                            if len(reason) == 0:
+                                reason = "暂无解释文本（后端尚未写入 explain_reason）。"
+                            st.markdown(f"**理由：** {reason}")
+
+                            e1, e2, e3, e4 = st.columns(4)
+                            e1.metric("confidence", f"{float(row['confidence']):.4f}")
+                            e2.metric("risk_score", f"{float(row['risk_score']):.4f}")
+                            e3.metric(
+                                "centroid_distance",
+                                f"{float(row.get('centroid_distance', 0.0)):.4f}",
+                            )
+                            e4.metric(
+                                "centroid_threshold",
+                                f"{float(row.get('centroid_threshold', 0.0)):.4f}",
+                            )
+
+                            raw_evidence = str(row.get("evidence_json", "")).strip()
+                            if len(raw_evidence) > 0:
+                                try:
+                                    ev = json.loads(raw_evidence)
+                                    st.json(ev)
+                                except Exception:
+                                    st.code(raw_evidence)
 
 else:
     st.markdown(
@@ -531,7 +621,7 @@ else:
     with left:
         selected_model = st.selectbox(
             "在线模型版本",
-            ["v1.0-传统统计特征", "v2.0-端到端 1D-CNN + UnknownRisk (当前)"],
+            ["v1.0-传统统计特征", "v2.0-端到端 Byte-Session + UnknownRisk (当前)"],
             index=1,
         )
         st.markdown(
@@ -539,19 +629,19 @@ else:
             <div class='model-card'>
                 <b>模型配置摘要</b><br><br>
                 当前版本: {selected_model}<br>
-                输入规格: 784 字节 -> 28x28<br>
+                输入规格: 12 packets x 256 bytes<br>
                 类别体系: VPN/NonVPN 12 类 + unknown<br>
-                检测器: {report.get('selected_detector', 'copod')}<br>
-                融合系数 alpha: {float(report.get('risk_decision', {}).get('risk_alpha', 0.5)):.2f}
+                检测器: centroid_distance<br>
+                阈值策略: per-class distance quantile
             </div>
             """,
             unsafe_allow_html=True,
         )
         st.markdown(" ")
-        st.metric(
-            "分类准确率", f"{float(report.get('classification_accuracy', 0.0)):.2%}"
-        )
-        st.metric("未知样本占比", f"{float(report.get('test_unknown_rate', 0.0)):.2%}")
+        acc = float(report.get("accuracy", report.get("classification_accuracy", 0.0)))
+        u_rate = float(report.get("unknown_rate", report.get("test_unknown_rate", 0.0)))
+        st.metric("分类准确率", f"{acc:.2%}")
+        st.metric("未知样本占比", f"{u_rate:.2%}")
 
     with right:
         fig_group = go.Figure(
