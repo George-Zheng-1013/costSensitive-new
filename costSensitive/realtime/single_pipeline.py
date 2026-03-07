@@ -75,6 +75,8 @@ class SinglePipelineRunner:
 
         self.batch: List[Dict] = []
         self.last_flush = time.time()
+        self.max_packet_explain_per_flush = 4
+        self.max_byte_explain_per_flush = 2
 
     @staticmethod
     def _load_label_map(path: Optional[str]) -> Dict[int, str]:
@@ -83,6 +85,133 @@ class SinglePipelineRunner:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
         return {int(v): k for k, v in raw.items()}
+
+    def _packet_contrib_occlusion(
+        self,
+        session_bytes: np.ndarray,
+        packet_mask: np.ndarray,
+        pred_id: int,
+        base_confidence: float,
+    ) -> Dict:
+        bytes_tensor = (
+            self.torch.from_numpy(session_bytes.astype(np.int64))
+            .unsqueeze(0)
+            .to(self.device)
+        )
+        mask_tensor = (
+            self.torch.from_numpy(packet_mask.astype(np.bool_))
+            .unsqueeze(0)
+            .to(self.device)
+        )
+
+        scores = np.zeros((self.cfg.num_packets,), dtype=np.float32)
+        with self.torch.no_grad():
+            for p in range(self.cfg.num_packets):
+                if not bool(packet_mask[p]):
+                    continue
+
+                bytes_occ = bytes_tensor.clone()
+                mask_occ = mask_tensor.clone()
+                bytes_occ[0, p, :] = int(self.cfg.byte_pad_token)
+                mask_occ[0, p] = False
+
+                logits_occ, _ = self.model(bytes_occ, mask_occ)
+                probs_occ = self.torch.softmax(logits_occ, dim=1)
+                conf_occ = float(probs_occ[0, pred_id].item())
+                scores[p] = float(max(0.0, base_confidence - conf_occ))
+
+        total = float(np.sum(scores))
+        if total > 1e-12:
+            norm_scores = (scores / total).astype(np.float32)
+        else:
+            norm_scores = scores
+
+        top_idx = np.argsort(-norm_scores)[:3].tolist()
+        top_idx = [int(i) for i in top_idx if float(norm_scores[i]) > 0]
+        return {
+            "method": "occlusion_conf_drop",
+            "scores": [float(x) for x in norm_scores.tolist()],
+            "top_packets": top_idx,
+        }
+
+    def _byte_gradcam_conv3(
+        self,
+        session_bytes: np.ndarray,
+        packet_mask: np.ndarray,
+        target_class: int,
+    ) -> Dict:
+        bytes_tensor = (
+            self.torch.from_numpy(session_bytes.astype(np.int64))
+            .unsqueeze(0)
+            .to(self.device)
+        )
+        mask_tensor = (
+            self.torch.from_numpy(packet_mask.astype(np.bool_))
+            .unsqueeze(0)
+            .to(self.device)
+        )
+
+        activations = {}
+        gradients = {}
+
+        def _forward_hook(_module, _inputs, output):
+            activations["value"] = output
+            # Tensor-level hook is more stable than module full backward hook here.
+            output.register_hook(lambda grad: gradients.__setitem__("value", grad))
+
+        hook_fwd = self.model.packet_encoder.conv3.register_forward_hook(_forward_hook)
+
+        try:
+            self.model.zero_grad(set_to_none=True)
+            # cuDNN RNN backward in eval mode can fail on some CUDA builds.
+            # Disable cuDNN only for this explainability pass.
+            with self.torch.backends.cudnn.flags(enabled=False):
+                logits, _ = self.model(bytes_tensor, mask_tensor)
+                score = logits[0, int(target_class)]
+                score.backward()
+
+            act = activations.get("value")
+            grad = gradients.get("value")
+            if act is None or grad is None:
+                return {
+                    "method": "gradcam_conv3",
+                    "packet_scores": [],
+                    "byte_heatmap": [],
+                    "top_packets": [],
+                }
+
+            # act/grad: [num_packets, channels, packet_len]
+            weights = grad.mean(dim=2, keepdim=True)
+            cam = self.torch.relu((weights * act).sum(dim=1))
+
+            cam = cam.detach().cpu().numpy().astype(np.float32)
+            if cam.shape[0] != self.cfg.num_packets:
+                cam = np.reshape(cam, (self.cfg.num_packets, self.cfg.packet_len))
+
+            valid_mask = packet_mask.astype(bool)
+            for i in range(self.cfg.num_packets):
+                if not valid_mask[i]:
+                    cam[i, :] = 0.0
+
+            max_val = float(np.max(cam))
+            if max_val > 1e-12:
+                cam = cam / max_val
+
+            packet_scores = cam.mean(axis=1)
+            top_idx = np.argsort(-packet_scores)[:3].tolist()
+            top_idx = [
+                int(i) for i in top_idx if valid_mask[i] and packet_scores[i] > 0
+            ]
+
+            return {
+                "method": "gradcam_conv3",
+                "packet_scores": [float(x) for x in packet_scores.tolist()],
+                "byte_heatmap": [[float(v) for v in row] for row in cam.tolist()],
+                "top_packets": top_idx,
+            }
+        finally:
+            hook_fwd.remove()
+            self.model.zero_grad(set_to_none=True)
 
     def _flush(self, writer, jsonf):
         if len(self.batch) == 0:
@@ -103,6 +232,8 @@ class SinglePipelineRunner:
             emb = self.model.extract_embedding(bytes_tensor, mask_tensor)
 
         now = time.time()
+        explained_count = 0
+        byte_explained_count = 0
         for i, item in enumerate(self.batch):
             pred_id = int(pred[i].item())
             confidence = float(conf[i].item())
@@ -141,6 +272,31 @@ class SinglePipelineRunner:
             else:
                 alert_level = "low"
 
+            packet_contrib = None
+            byte_heatmap = None
+            if (
+                alert_level in {"medium", "high"}
+                and explained_count < self.max_packet_explain_per_flush
+            ):
+                packet_contrib = self._packet_contrib_occlusion(
+                    session_bytes=item["session_bytes"],
+                    packet_mask=item["packet_mask"],
+                    pred_id=pred_id,
+                    base_confidence=confidence,
+                )
+                explained_count += 1
+
+            if (
+                alert_level in {"medium", "high"}
+                and byte_explained_count < self.max_byte_explain_per_flush
+            ):
+                byte_heatmap = self._byte_gradcam_conv3(
+                    session_bytes=item["session_bytes"],
+                    packet_mask=item["packet_mask"],
+                    target_class=pred_id,
+                )
+                byte_explained_count += 1
+
             record = {
                 "sample_id": item["sample_id"],
                 "flow_key": str(item["flow_key"]),
@@ -159,6 +315,16 @@ class SinglePipelineRunner:
                 "final_pred": final_pred,
                 "final_pred_name": final_pred_name,
                 "alert_level": alert_level,
+                "packet_contrib_json": (
+                    json.dumps(packet_contrib, ensure_ascii=False)
+                    if packet_contrib is not None
+                    else ""
+                ),
+                "byte_heatmap_json": (
+                    json.dumps(byte_heatmap, ensure_ascii=False)
+                    if byte_heatmap is not None
+                    else ""
+                ),
             }
 
             writer.writerow(
@@ -180,6 +346,8 @@ class SinglePipelineRunner:
                     record["final_pred"],
                     record["final_pred_name"],
                     record["alert_level"],
+                    record["packet_contrib_json"],
+                    record["byte_heatmap_json"],
                 ]
             )
             jsonf.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -242,6 +410,8 @@ class SinglePipelineRunner:
                     "final_pred",
                     "final_pred_name",
                     "alert_level",
+                    "packet_contrib_json",
+                    "byte_heatmap_json",
                 ]
             )
 

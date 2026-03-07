@@ -27,9 +27,10 @@ class PacketEncoder(nn.Module):
         # packet_bytes: [N, packet_len]
         x = self.embedding(packet_bytes)  # [N, packet_len, emb]
         x = x.transpose(1, 2)  # [N, emb, packet_len]
-        x = F.relu(self.conv1(x), inplace=True)
-        x = F.relu(self.conv2(x), inplace=True)
-        x = F.relu(self.conv3(x), inplace=True)
+        # Keep non-inplace ReLU to avoid Grad-CAM backward-hook conflicts.
+        x = F.relu(self.conv1(x), inplace=False)
+        x = F.relu(self.conv2(x), inplace=False)
+        x = F.relu(self.conv3(x), inplace=False)
         x = self.pool(x).squeeze(-1)  # [N, 128]
         return self.proj(x)  # [N, out_dim]
 

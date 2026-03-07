@@ -184,6 +184,8 @@ ALERT_COLUMNS = [
     "centroid_threshold",
     "explain_reason",
     "evidence_json",
+    "packet_contrib_json",
+    "byte_heatmap_json",
 ]
 
 REAL_CLASS_NAMES = [
@@ -230,6 +232,10 @@ def load_db_table(db_path: str) -> pd.DataFrame:
             df["explain_reason"] = ""
         if "evidence_json" not in df.columns:
             df["evidence_json"] = ""
+        if "packet_contrib_json" not in df.columns:
+            df["packet_contrib_json"] = ""
+        if "byte_heatmap_json" not in df.columns:
+            df["byte_heatmap_json"] = ""
     return df
 
 
@@ -606,6 +612,134 @@ if page == "实时监控大屏":
                                     st.json(ev)
                                 except Exception:
                                     st.code(raw_evidence)
+
+                            raw_packet_contrib = str(
+                                row.get("packet_contrib_json", "")
+                            ).strip()
+                            if len(raw_packet_contrib) > 0:
+                                try:
+                                    pc = json.loads(raw_packet_contrib)
+                                    scores = pc.get("scores", [])
+                                    if isinstance(scores, list) and len(scores) > 0:
+                                        contrib_df = pd.DataFrame(
+                                            {
+                                                "packet_idx": list(range(len(scores))),
+                                                "contribution": [
+                                                    float(x) for x in scores
+                                                ],
+                                            }
+                                        )
+                                        fig_pc = px.bar(
+                                            contrib_df,
+                                            x="packet_idx",
+                                            y="contribution",
+                                            title="包级贡献图（Occlusion）",
+                                            color="contribution",
+                                            color_continuous_scale=[
+                                                "#173564",
+                                                "#2B7BFF",
+                                                "#00F0FF",
+                                            ],
+                                        )
+                                        fig_pc.update_layout(
+                                            template="plotly_white",
+                                            paper_bgcolor="rgba(0,0,0,0)",
+                                            plot_bgcolor="rgba(255, 255, 255, 0.95)",
+                                            coloraxis_showscale=False,
+                                            xaxis_title="packet index",
+                                            yaxis_title="normalized contribution",
+                                            margin=dict(l=10, r=10, t=50, b=10),
+                                        )
+                                        st.plotly_chart(fig_pc, width="stretch")
+                                except Exception:
+                                    st.code(raw_packet_contrib)
+
+                            raw_byte_heatmap = str(
+                                row.get("byte_heatmap_json", "")
+                            ).strip()
+                            if len(raw_byte_heatmap) > 0:
+                                try:
+                                    bh = json.loads(raw_byte_heatmap)
+                                    heatmap = bh.get("byte_heatmap", [])
+                                    packet_scores = bh.get("packet_scores", [])
+                                    top_packets = bh.get("top_packets", [])
+
+                                    if (
+                                        isinstance(heatmap, list)
+                                        and len(heatmap) > 0
+                                        and isinstance(heatmap[0], list)
+                                    ):
+                                        z = np.array(heatmap, dtype=float)
+                                        fig_hm = go.Figure(
+                                            data=go.Heatmap(
+                                                z=z,
+                                                colorscale=[
+                                                    [0.0, "#173564"],
+                                                    [0.35, "#2B7BFF"],
+                                                    [0.7, "#00C7D6"],
+                                                    [1.0, "#FFD166"],
+                                                ],
+                                                colorbar=dict(title="importance"),
+                                            )
+                                        )
+                                        fig_hm.update_layout(
+                                            title="字节热力图（Grad-CAM）",
+                                            template="plotly_white",
+                                            paper_bgcolor="rgba(0,0,0,0)",
+                                            plot_bgcolor="rgba(255, 255, 255, 0.95)",
+                                            xaxis_title="byte index",
+                                            yaxis_title="packet index",
+                                            margin=dict(l=10, r=10, t=50, b=10),
+                                            height=360,
+                                        )
+                                        st.plotly_chart(fig_hm, width="stretch")
+
+                                        if (
+                                            isinstance(packet_scores, list)
+                                            and len(packet_scores) > 0
+                                        ):
+                                            ps_df = pd.DataFrame(
+                                                {
+                                                    "packet_idx": list(
+                                                        range(len(packet_scores))
+                                                    ),
+                                                    "score": [
+                                                        float(v) for v in packet_scores
+                                                    ],
+                                                }
+                                            )
+                                            fig_ps = px.bar(
+                                                ps_df,
+                                                x="packet_idx",
+                                                y="score",
+                                                title="Grad-CAM 包级平均贡献",
+                                                color="score",
+                                                color_continuous_scale=[
+                                                    "#173564",
+                                                    "#2B7BFF",
+                                                    "#00F0FF",
+                                                ],
+                                            )
+                                            fig_ps.update_layout(
+                                                template="plotly_white",
+                                                paper_bgcolor="rgba(0,0,0,0)",
+                                                plot_bgcolor="rgba(255, 255, 255, 0.95)",
+                                                coloraxis_showscale=False,
+                                                xaxis_title="packet index",
+                                                yaxis_title="mean importance",
+                                                margin=dict(l=10, r=10, t=50, b=10),
+                                            )
+                                            st.plotly_chart(fig_ps, width="stretch")
+
+                                        if isinstance(top_packets, list):
+                                            st.caption(
+                                                "Grad-CAM Top Packets: "
+                                                + ", ".join(
+                                                    [str(int(v)) for v in top_packets]
+                                                )
+                                            )
+                                except Exception:
+                                    st.code(raw_byte_heatmap)
 
 else:
     st.markdown(

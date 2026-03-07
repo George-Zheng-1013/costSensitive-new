@@ -50,7 +50,9 @@ def init_db(db_path: str) -> None:
             centroid_distance REAL,
             centroid_threshold REAL,
             explain_reason TEXT,
-            evidence_json TEXT
+            evidence_json TEXT,
+            packet_contrib_json TEXT,
+            byte_heatmap_json TEXT
         )
         """
     )
@@ -62,6 +64,8 @@ def init_db(db_path: str) -> None:
         "centroid_threshold": "REAL",
         "explain_reason": "TEXT",
         "evidence_json": "TEXT",
+        "packet_contrib_json": "TEXT",
+        "byte_heatmap_json": "TEXT",
     }
     for col, col_type in extra_cols.items():
         if col not in existing_cols:
@@ -167,7 +171,22 @@ def build_explainability(
 
 def convert_record(
     record: Dict,
-) -> Tuple[str, str, str, str, str, float, float, str, float, float, str, str]:
+) -> Tuple[
+    str,
+    str,
+    str,
+    str,
+    str,
+    float,
+    float,
+    str,
+    float,
+    float,
+    str,
+    str,
+    str,
+    str,
+]:
     src_ip, dst_ip, protocol = parse_flow_key(str(record.get("flow_key", "")))
     timestamp = normalize_timestamp(record)
 
@@ -213,6 +232,8 @@ def convert_record(
         centroid_threshold=centroid_threshold,
         is_unknown=is_unknown,
     )
+    packet_contrib_json = str(record.get("packet_contrib_json", "") or "")
+    byte_heatmap_json = str(record.get("byte_heatmap_json", "") or "")
 
     return (
         timestamp,
@@ -227,12 +248,29 @@ def convert_record(
         round(centroid_threshold, 6),
         explain_reason,
         evidence_json,
+        packet_contrib_json,
+        byte_heatmap_json,
     )
 
 
 def insert_record(
     conn: sqlite3.Connection,
-    row: Tuple[str, str, str, str, str, float, float, str, float, float, str, str],
+    row: Tuple[
+        str,
+        str,
+        str,
+        str,
+        str,
+        float,
+        float,
+        str,
+        float,
+        float,
+        str,
+        str,
+        str,
+        str,
+    ],
 ) -> None:
     cursor = conn.cursor()
     cursor.execute(
@@ -250,9 +288,11 @@ def insert_record(
             centroid_distance,
             centroid_threshold,
             explain_reason,
-            evidence_json
+            evidence_json,
+            packet_contrib_json,
+            byte_heatmap_json
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         row,
     )
