@@ -1,0 +1,27 @@
+@import './base.css';
+
+#app {
+    min-height: 100vh;
+}
+
+.card {
+    border-radius: 14px;
+    border: 1px solid var(--line);
+    background: var(--bg-card);
+    box-shadow: 0 6px 24px rgba(34, 66, 131, 0.08);
+}
+
+.card-title {
+    margin-bottom: 10px;
+    font-weight: 600;
+    color: var(--text-main);
+}
+
+.muted {
+    color: var(--text-sub);
+}
+
+.metric-value {
+    font-size: 28px;
+    font-weight: 700;
+}

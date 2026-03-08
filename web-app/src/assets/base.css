@@ -1,0 +1,31 @@
+:root {
+    --bg-primary: #f6f8fb;
+    --bg-card: #ffffff;
+    --bg-accent: #e8eef9;
+    --line: #d8e1f0;
+    --text-main: #1f2a44;
+    --text-sub: #5b6784;
+    --danger: #d14b4b;
+    --warning: #f5a524;
+    --ok: #36a16b;
+    --brand: #2e6fd8;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+    margin: 0;
+    padding: 0;
+    min-height: 100%;
+}
+
+body {
+    background: radial-gradient(circle at 10% 0%, #e5edf9 0%, var(--bg-primary) 45%, #f8fbff 100%);
+    color: var(--text-main);
+    line-height: 1.5;
+    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}

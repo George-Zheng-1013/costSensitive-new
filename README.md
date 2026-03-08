@@ -83,3 +83,31 @@ python main_realtime.py --mode pcap --source dataset/iscx --model-path pytorch_m
 
 - 旧链路（图像化预处理、MNIST IDX、ConvNet 训练脚本）已移除。
 - 当前实时入口支持 `pcap` 模式。
+
+## 全链路启动（FastAPI + 入库引擎）
+
+后端已支持一键联动：启动 FastAPI 时自动启动 `backend_engine` 写库线程。
+
+```powershell
+python run_full_chain.py --host 127.0.0.1 --port 8000 --reload
+```
+
+Windows 下也可直接执行：
+
+```powershell
+start_full_chain.bat
+```
+
+可选环境变量：
+
+- `NETGUARD_AUTOSTART_ENGINE=0`：仅启 API，不自动拉起入库引擎。
+- `NETGUARD_ENGINE_AUTOCAPTURE=1`：自动拉起实时抓包推理子进程。
+- `NETGUARD_CAPTURE_SOURCE`：抓包网卡源。
+- `NETGUARD_CAPTURE_DEVICE`：推理设备（`cpu`/`cuda`）。
+
+前端开发模式：
+
+```powershell
+cd web-app
+npm run dev
+```
