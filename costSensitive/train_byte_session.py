@@ -39,7 +39,7 @@ def parse_args():
     parser.add_argument("--flow-timeout-s", type=float, default=10.0)
     parser.add_argument("--max-flows-per-class", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=8)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
