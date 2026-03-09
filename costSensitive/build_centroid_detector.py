@@ -12,6 +12,17 @@ from realtime.unknown_detector import build_centroid_detector_dict
 from session_data import ByteSessionDataset
 
 
+def iter_with_progress(iterable, total, desc: str, enable: bool):
+    if not enable:
+        return iterable
+    try:
+        from tqdm.auto import tqdm
+
+        return tqdm(iterable, total=total, desc=desc, leave=False)
+    except Exception:
+        return iterable
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Build centroid unknown detector from train embeddings"
@@ -43,6 +54,11 @@ def parse_args():
         "--output-json",
         default=os.path.join("pytorch_model", "centroid_detector.json"),
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="disable tqdm progress bars",
+    )
     return parser.parse_args()
 
 
@@ -54,6 +70,7 @@ def get_device(device_arg: str):
 
 def main():
     args = parse_args()
+    show_progress = not args.no_progress
 
     if not os.path.exists(args.model_path):
         raise FileNotFoundError(f"model not found: {args.model_path}")
@@ -77,7 +94,14 @@ def main():
     all_labels: List[np.ndarray] = []
 
     with torch.no_grad():
-        for batch in loader:
+        loop = iter_with_progress(
+            loader,
+            total=len(loader),
+            desc="build-ood-centroids",
+            enable=show_progress,
+        )
+        processed = 0
+        for batch in loop:
             x = batch["bytes"].to(device)
             mask = batch["packet_mask"].to(device)
             y = batch["label"].cpu().numpy().astype(np.int64)
@@ -85,6 +109,12 @@ def main():
             _, emb = model(x, mask)
             all_embeddings.append(emb.cpu().numpy().astype(np.float32))
             all_labels.append(y)
+
+            processed += int(y.shape[0])
+            if show_progress:
+                set_postfix = getattr(loop, "set_postfix", None)
+                if callable(set_postfix):
+                    set_postfix(samples=processed)
 
     embeddings = np.concatenate(all_embeddings, axis=0)
     labels = np.concatenate(all_labels, axis=0)

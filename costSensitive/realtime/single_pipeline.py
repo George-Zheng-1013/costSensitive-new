@@ -56,7 +56,7 @@ class SinglePipelineRunner:
         )
 
         self.label_map = self._load_label_map(label_map_path)
-        num_classes = max(self.label_map.keys(), default=11) + 1
+        num_classes = max(self.label_map.keys(), default=10) + 1
         self.unknown_label = unknown_label
 
         self.model = ByteSessionClassifier(num_classes=num_classes).to(self.device)
@@ -252,14 +252,10 @@ class SinglePipelineRunner:
                 else self.label_map.get(pred_id, str(pred_id))
             )
             centroid_distance = (
-                float(decision.centroid_distance)
-                if decision is not None
-                else float("nan")
+                float(decision.centroid_distance) if decision is not None else None
             )
             centroid_threshold = (
-                float(decision.centroid_threshold)
-                if decision is not None
-                else float("nan")
+                float(decision.centroid_threshold) if decision is not None else None
             )
             anomaly_score = (
                 float(decision.anomaly_score) if decision is not None else 0.0
@@ -339,8 +335,16 @@ class SinglePipelineRunner:
                     record["pred_name"],
                     f"{record['confidence']:.6f}",
                     f"{record['embedding_norm']:.6f}",
-                    f"{record['centroid_distance']:.6f}",
-                    f"{record['centroid_threshold']:.6f}",
+                    (
+                        f"{record['centroid_distance']:.6f}"
+                        if record["centroid_distance"] is not None
+                        else ""
+                    ),
+                    (
+                        f"{record['centroid_threshold']:.6f}"
+                        if record["centroid_threshold"] is not None
+                        else ""
+                    ),
                     f"{record['anomaly_score']:.6f}",
                     record["is_unknown"],
                     record["final_pred"],

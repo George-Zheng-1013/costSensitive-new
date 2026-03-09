@@ -25,7 +25,7 @@ export const useDashboardStore = defineStore('dashboard', {
         xaiDetail: null,
         aiAlertInsights: [],
         aiBehaviorInsights: [],
-        modelMetrics: { radar: { labels: [], baseline: [], netguard: [] } },
+        modelMetrics: { num_classes: 11, radar: { labels: [], baseline: [], netguard: [] } },
         wsStatus: {
             overview: 'idle',
             alerts: 'idle',

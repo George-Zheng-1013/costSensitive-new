@@ -12,6 +12,17 @@ from realtime.unknown_detector import CentroidUnknownDetector
 from session_data import ByteSessionDataset
 
 
+def iter_with_progress(iterable, total, desc: str, enable: bool):
+    if not enable:
+        return iterable
+    try:
+        from tqdm.auto import tqdm
+
+        return tqdm(iterable, total=total, desc=desc, leave=False)
+    except Exception:
+        return iterable
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Byte-session offline inference")
     parser.add_argument(
@@ -45,6 +56,11 @@ def parse_args():
         "--detector-json",
         default=os.path.join("pytorch_model", "centroid_detector.json"),
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="disable tqdm progress bars",
+    )
     parser.add_argument("--unknown-label", default="unknown_proxy_ood")
     return parser.parse_args()
 
@@ -63,8 +79,51 @@ def load_label_map(path: str):
     return {int(v): k for k, v in raw.items()}
 
 
+def compute_per_class_metrics(conf_mat: np.ndarray, label_map: dict):
+    out = []
+    precisions = []
+    recalls = []
+    f1s = []
+
+    for i in range(conf_mat.shape[0]):
+        tp = float(conf_mat[i, i])
+        fp = float(conf_mat[:, i].sum() - tp)
+        fn = float(conf_mat[i, :].sum() - tp)
+        support = int(conf_mat[i, :].sum())
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (
+            2.0 * precision * recall / (precision + recall)
+            if (precision + recall) > 0
+            else 0.0
+        )
+
+        out.append(
+            {
+                "class_id": i,
+                "class_name": label_map.get(i, str(i)),
+                "support": support,
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+            }
+        )
+        precisions.append(precision)
+        recalls.append(recall)
+        f1s.append(f1)
+
+    macro = {
+        "precision": float(np.mean(precisions)) if precisions else 0.0,
+        "recall": float(np.mean(recalls)) if recalls else 0.0,
+        "f1": float(np.mean(f1s)) if f1s else 0.0,
+    }
+    return out, macro
+
+
 def main():
     args = parse_args()
+    show_progress = not args.no_progress
 
     if not os.path.exists(args.model_path):
         raise FileNotFoundError(f"model not found: {args.model_path}")
@@ -94,9 +153,16 @@ def main():
     total = 0
     correct = 0
     unknown_count = 0
+    conf_mat = np.zeros((num_classes, num_classes), dtype=np.int64)
 
     with torch.no_grad():
-        for batch in loader:
+        infer_loop = iter_with_progress(
+            loader,
+            total=len(loader),
+            desc="inference",
+            enable=show_progress,
+        )
+        for batch in infer_loop:
             x = batch["bytes"].to(device)
             mask = batch["packet_mask"].to(device)
             y = batch["label"].to(device)
@@ -108,6 +174,12 @@ def main():
 
             total += y.size(0)
             correct += pred.eq(y).sum().item()
+
+            y_np = y.detach().cpu().numpy().astype(np.int64)
+            p_np = pred.detach().cpu().numpy().astype(np.int64)
+            for yi, pi in zip(y_np, p_np):
+                if 0 <= yi < num_classes and 0 <= pi < num_classes:
+                    conf_mat[yi, pi] += 1
 
             all_embeddings.append(emb.cpu().numpy())
             for i in range(y.size(0)):
@@ -158,6 +230,14 @@ def main():
                     }
                 )
 
+            if show_progress:
+                set_postfix = getattr(infer_loop, "set_postfix", None)
+                if callable(set_postfix):
+                    set_postfix(
+                        acc=f"{(100.0 * correct / max(total, 1)):.2f}%",
+                        unknown=f"{unknown_count}",
+                    )
+
     embeddings = np.concatenate(all_embeddings, axis=0)
     np.save(args.embedding_npy, embeddings)
 
@@ -179,7 +259,13 @@ def main():
                 "final_pred_name",
             ]
         )
-        for row in all_rows:
+        row_loop = iter_with_progress(
+            all_rows,
+            total=len(all_rows),
+            desc="write-csv",
+            enable=show_progress,
+        )
+        for row in row_loop:
             writer.writerow(
                 [
                     row["flow_id"],
@@ -198,10 +284,17 @@ def main():
             )
 
     acc = correct / total if total > 0 else 0.0
+    per_class, macro = compute_per_class_metrics(conf_mat, label_map)
     report = {
         "split": args.split,
         "num_samples": total,
+        "num_classes": num_classes,
         "accuracy": acc,
+        "macro_precision": macro["precision"],
+        "macro_recall": macro["recall"],
+        "macro_f1": macro["f1"],
+        "per_class": per_class,
+        "confusion_matrix": conf_mat.tolist(),
         "unknown_count": int(unknown_count),
         "unknown_rate": (unknown_count / total if total > 0 else 0.0),
         "detector_enabled": bool(detector.enabled),

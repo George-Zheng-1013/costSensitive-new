@@ -8,7 +8,7 @@
 - 包掩码：`packet_mask [B, num_packets]`
 - 模型：`PacketEncoder + SessionEncoder(BiGRU) + Embedding Head + Classifier`
 - 推理：支持分类预测与 embedding 导出
-- 实时：基于流组装会话后进行实时推理（pcap 模式）
+- 实时：基于流组装会话后进行实时推理（`live` 抓包模式）
 
 ## 关键文件
 
@@ -28,7 +28,7 @@
 - `costSensitive/inference.py`
   - 离线推理与 embedding 导出
 - `costSensitive/main_realtime.py`
-  - 实时 pcap 推理入口
+  - 实时抓包推理入口（`--mode live`）
 
 ## 快速开始
 
@@ -47,7 +47,7 @@ python session_data.py --dataset-root dataset/iscx --output-root processed_full/
 ### 2) 训练新模型
 
 ```powershell
-python train_byte_session.py --manifest processed_full/sessions/manifest.csv --epochs 8 --batch-size 32
+python train_byte_session.py --manifest processed_full/sessions/manifest.csv --max_epoch 8 --batch-size 32
 ```
 
 若还未生成 manifest，可直接让训练脚本自动构建：
@@ -68,10 +68,10 @@ python inference.py --manifest processed_full/sessions/manifest.csv --model-path
 - `pytorch_model/session_embeddings.npy`
 - `pytorch_model/session_eval_report.json`
 
-### 4) 实时 pcap 推理
+### 4) 实时抓包推理
 
 ```powershell
-python main_realtime.py --mode pcap --source dataset/iscx --model-path pytorch_model/byte_session_classifier.pth --label-map processed_full/sessions/label_map.json --output-dir pytorch_model/realtime_sessions
+python main_realtime.py --mode live --source "\\Device\\NPF_{你的网卡GUID}" --model-path pytorch_model/byte_session_classifier.pth --label-map processed_full/sessions/label_map.json --output-dir pytorch_model/realtime_sessions
 ```
 
 输出：
@@ -82,7 +82,7 @@ python main_realtime.py --mode pcap --source dataset/iscx --model-path pytorch_m
 ## 说明
 
 - 旧链路（图像化预处理、MNIST IDX、ConvNet 训练脚本）已移除。
-- 当前实时入口支持 `pcap` 模式。
+- 当前实时入口仅支持 `live` 模式（Scapy 实时抓包）。
 
 ## 全链路启动（FastAPI + 入库引擎）
 

@@ -58,6 +58,7 @@ const scoreTag = computed(() => {
 
     <section class="card chart-card two-col">
       <h3 class="card-title">模型综合指标</h3>
+      <p class="muted">当前分类体系: {{ Number(store.modelMetrics.num_classes || 11) }} 类</p>
       <RadarChart :radar="store.modelMetrics.radar" />
     </section>
   </div>

@@ -3,6 +3,7 @@ import csv
 import json
 import os
 import random
+import re
 import socket
 import time
 from dataclasses import dataclass, field
@@ -22,7 +23,6 @@ CLASS_NAMES = [
     "nonvpn_chat",
     "nonvpn_email",
     "nonvpn_file_transfer",
-    "nonvpn_p2p",
     "nonvpn_streaming",
     "nonvpn_voip",
     "vpn_chat",
@@ -57,13 +57,16 @@ NONVPN_PREFIX_TO_CLASS = {
     "sftpdown": "nonvpn_file_transfer",
     "sftpup": "nonvpn_file_transfer",
     "skype_file": "nonvpn_file_transfer",
-    "bittorrent": "nonvpn_p2p",
-    "torrent": "nonvpn_p2p",
+    # Non-VPN P2P samples are effectively unavailable in this dataset build.
+    # Merge these aliases into vpn_p2p so P2P traffic still maps to a valid class.
+    "bittorrent": "vpn_p2p",
+    "torrent": "vpn_p2p",
     "netflix": "nonvpn_streaming",
     "spotify": "nonvpn_streaming",
     "vimeo": "nonvpn_streaming",
     "youtube": "nonvpn_streaming",
     "youtubehtml": "nonvpn_streaming",
+    "youtubehtml5": "nonvpn_streaming",
     "facebook_video": "nonvpn_streaming",
     "hangouts_video": "nonvpn_streaming",
     "skype_video": "nonvpn_streaming",
@@ -75,6 +78,7 @@ NONVPN_PREFIX_TO_CLASS = {
 
 VPN_PREFIX_TO_CLASS = {
     "aim_chat": "vpn_chat",
+    "chat": "vpn_chat",
     "facebook_chat": "vpn_chat",
     "hangouts_chat": "vpn_chat",
     "icq_chat": "vpn_chat",
@@ -99,6 +103,54 @@ VPN_PREFIX_TO_CLASS = {
     "skype_audio": "vpn_voip",
     "voipbuster": "vpn_voip",
 }
+
+
+def _normalize_capture_stem(stem: str) -> List[str]:
+    # Build multiple normalized candidates so variants like email1a,
+    # vpn_facebook_chat1b, youtubeHTML5_1 can still be mapped.
+    candidates = []
+    seen = set()
+
+    def add(value: str) -> None:
+        value = value.strip("_")
+        if value and value not in seen:
+            seen.add(value)
+            candidates.append(value)
+
+    add(stem)
+    add(re.sub(r"\d+[a-z]$", "", stem))
+    add(re.sub(r"\d+$", "", stem))
+    add(re.sub(r"_[a-z]$", "", stem))
+
+    # Repeatedly drop trailing counters/suffixes like _1, 1a, _a.
+    cur = stem
+    while True:
+        nxt = re.sub(r"(?:_?\d+[a-z]?|_[a-z])$", "", cur)
+        nxt = nxt.strip("_")
+        if nxt == cur or not nxt:
+            break
+        add(nxt)
+        cur = nxt
+
+    return candidates
+
+
+def _resolve_class_name(cleaned_candidates: List[str], domain: str) -> Optional[str]:
+    prefix_to_class = VPN_PREFIX_TO_CLASS if domain == "vpn" else NONVPN_PREFIX_TO_CLASS
+
+    for cand in cleaned_candidates:
+        direct = prefix_to_class.get(cand)
+        if direct is not None:
+            return direct
+
+    # Fallback: longest known prefix wins for names with trailing episode marks.
+    sorted_prefixes = sorted(prefix_to_class.keys(), key=len, reverse=True)
+    for cand in cleaned_candidates:
+        for pref in sorted_prefixes:
+            if cand.startswith(pref):
+                return prefix_to_class[pref]
+
+    return None
 
 
 FlowKey = Tuple[str, str, int, int, int]
@@ -227,19 +279,12 @@ def infer_label_from_filename(file_name: str, domain: str) -> int:
     if domain == "vpn" and stem.startswith("vpn_"):
         stem = stem[4:]
 
-    cleaned = stem
-    while len(cleaned) > 0 and cleaned[-1].isdigit():
-        cleaned = cleaned[:-1]
-    cleaned = cleaned.rstrip("_")
-
-    if domain == "vpn":
-        class_name = VPN_PREFIX_TO_CLASS.get(cleaned)
-    else:
-        class_name = NONVPN_PREFIX_TO_CLASS.get(cleaned)
+    candidates = _normalize_capture_stem(stem)
+    class_name = _resolve_class_name(candidates, domain)
 
     if class_name is None:
         raise ValueError(
-            f"unknown prefix: {cleaned} (domain={domain}, file={file_name})"
+            f"unknown prefix candidates={candidates} (domain={domain}, file={file_name})"
         )
     return CLASS_TO_ID[class_name]
 

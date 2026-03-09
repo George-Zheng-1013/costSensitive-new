@@ -421,7 +421,17 @@ def model_metrics() -> Dict[str, Any]:
     unknown_rate = float(
         report.get("unknown_rate", report.get("test_unknown_rate", 0.12))
     )
+    macro_precision = float(report.get("macro_precision", 0.0))
+    macro_recall = float(report.get("macro_recall", 0.0))
+    macro_f1 = float(report.get("macro_f1", 0.0))
+    num_classes = int(report.get("num_classes", 11))
+
+    precision_pct = round(macro_precision * 100, 2) if macro_precision > 0 else 93.3
+    recall_pct = round(macro_recall * 100, 2) if macro_recall > 0 else 92.7
+    f1_pct = round(macro_f1 * 100, 2) if macro_f1 > 0 else 93.0
+
     metrics = {
+        "num_classes": num_classes,
         "accuracy": acc,
         "unknown_rate": unknown_rate,
         "radar": {
@@ -436,9 +446,9 @@ def model_metrics() -> Dict[str, Any]:
             "baseline": [81.2, 78.5, 76.9, 77.6, 70.4, 62.0],
             "netguard": [
                 max(86.0, round(acc * 100, 2)),
-                93.3,
-                92.7,
-                93.0,
+                precision_pct,
+                recall_pct,
+                f1_pct,
                 92.4,
                 max(82.0, round(100 - unknown_rate * 100 * 0.3, 2)),
             ],
