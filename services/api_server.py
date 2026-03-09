@@ -1,14 +1,20 @@
 import json
 import os
 import asyncio
+import time
+import ipaddress
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from services import backend_engine
+from services.ai_analyst import TrafficAIAnalyst
+from services.ai_config import AIConfig
 
 try:
     import sqlite3
@@ -35,6 +41,16 @@ app.add_middleware(
 
 _engine_thread: Optional[threading.Thread] = None
 DEFAULT_CAPTURE_SOURCE = r"\Device\NPF_{94B4B764-8E09-485A-9EF1-10C26641DF79}"
+GEO_CACHE_TTL_S = 12 * 60 * 60
+GEO_QUERY_TIMEOUT_S = 1.5
+MAX_ONLINE_GEO_LOOKUPS = 80
+GEO_CACHE_TABLE = "ip_geo_cache"
+_geo_cache_lock = threading.Lock()
+_geo_cache: Dict[str, Dict[str, Any]] = {}
+_geo_cache_loaded = False
+_xai_explain_cache_lock = threading.Lock()
+_xai_explain_cache: Dict[int, Dict[str, Any]] = {}
+XAI_EXPLAIN_CACHE_TTL_S = 15 * 60
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -96,6 +112,7 @@ def _start_engine_if_needed() -> None:
 
 @app.on_event("startup")
 async def _on_startup() -> None:
+    _ensure_geo_cache_loaded()
     _start_engine_if_needed()
 
 
@@ -145,6 +162,268 @@ def _normalize_packet_contrib(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def _init_geo_cache_table(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {GEO_CACHE_TABLE} (
+            ip TEXT PRIMARY KEY,
+            country TEXT,
+            country_code TEXT,
+            region TEXT,
+            city TEXT,
+            lat REAL,
+            lon REAL,
+            cached_at REAL NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+
+def _ensure_geo_cache_loaded() -> None:
+    global _geo_cache_loaded
+    if _geo_cache_loaded:
+        return
+
+    with _geo_cache_lock:
+        if _geo_cache_loaded:
+            return
+
+        conn = _db_conn()
+        try:
+            _init_geo_cache_table(conn)
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT ip, country, country_code, region, city, lat, lon, cached_at FROM {GEO_CACHE_TABLE}"
+            )
+            for row in cur.fetchall():
+                ip = str(row["ip"])
+                _geo_cache[ip] = {
+                    "cached_at": float(row["cached_at"]),
+                    "value": {
+                        "ip": ip,
+                        "country": str(row["country"] or ""),
+                        "country_code": str(row["country_code"] or ""),
+                        "region": str(row["region"] or ""),
+                        "city": str(row["city"] or ""),
+                        "lat": float(row["lat"] or 0.0),
+                        "lon": float(row["lon"] or 0.0),
+                    },
+                }
+        finally:
+            conn.close()
+
+        _geo_cache_loaded = True
+
+
+def _persist_geo_cache_row(ip: str, value: Dict[str, Any], cached_at: float) -> None:
+    conn = _db_conn()
+    try:
+        _init_geo_cache_table(conn)
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            INSERT INTO {GEO_CACHE_TABLE}
+            (ip, country, country_code, region, city, lat, lon, cached_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ip) DO UPDATE SET
+                country=excluded.country,
+                country_code=excluded.country_code,
+                region=excluded.region,
+                city=excluded.city,
+                lat=excluded.lat,
+                lon=excluded.lon,
+                cached_at=excluded.cached_at
+            """,
+            (
+                str(ip),
+                str(value.get("country") or ""),
+                str(value.get("country_code") or ""),
+                str(value.get("region") or ""),
+                str(value.get("city") or ""),
+                float(value.get("lat") or 0.0),
+                float(value.get("lon") or 0.0),
+                float(cached_at),
+            ),
+        )
+        conn.commit()
+    except Exception:
+        # Keep API resilient if persistence fails.
+        pass
+    finally:
+        conn.close()
+
+
+def _is_public_ip(ip: str) -> bool:
+    try:
+        ip_obj = ipaddress.ip_address(str(ip))
+    except Exception:
+        return False
+    return not (
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_reserved
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_unspecified
+    )
+
+
+def _http_get_json(url: str, timeout_s: float) -> Optional[Dict[str, Any]]:
+    req = urlrequest.Request(
+        url,
+        headers={
+            "User-Agent": "NetGuard-GeoResolver/1.0",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=timeout_s) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            return json.loads(body)
+    except (urlerror.URLError, TimeoutError, ValueError, OSError):
+        return None
+
+
+def _geo_lookup_online(ip: str) -> Optional[Dict[str, Any]]:
+    # Provider 1: ip-api.com
+    url1 = (
+        "http://ip-api.com/json/"
+        f"{ip}?fields=status,country,countryCode,regionName,city,lat,lon,query"
+    )
+    d1 = _http_get_json(url1, GEO_QUERY_TIMEOUT_S)
+    if isinstance(d1, dict) and d1.get("status") == "success":
+        try:
+            return {
+                "ip": str(d1.get("query", ip)),
+                "country": str(d1.get("country") or ""),
+                "country_code": str(d1.get("countryCode") or ""),
+                "region": str(d1.get("regionName") or ""),
+                "city": str(d1.get("city") or ""),
+                "lat": float(d1.get("lat")),
+                "lon": float(d1.get("lon")),
+            }
+        except Exception:
+            pass
+
+    # Provider 2: ipwho.is
+    url2 = f"https://ipwho.is/{ip}"
+    d2 = _http_get_json(url2, GEO_QUERY_TIMEOUT_S)
+    if isinstance(d2, dict) and bool(d2.get("success")):
+        try:
+            return {
+                "ip": str(d2.get("ip", ip)),
+                "country": str(d2.get("country") or ""),
+                "country_code": str(d2.get("country_code") or ""),
+                "region": str(d2.get("region") or ""),
+                "city": str(d2.get("city") or ""),
+                "lat": float(d2.get("latitude")),
+                "lon": float(d2.get("longitude")),
+            }
+        except Exception:
+            return None
+
+    return None
+
+
+def _geo_lookup_cached(ip: str, allow_online: bool = True) -> Optional[Dict[str, Any]]:
+    _ensure_geo_cache_loaded()
+    now = time.time()
+    with _geo_cache_lock:
+        cached = _geo_cache.get(ip)
+        if (
+            cached is not None
+            and now - float(cached.get("cached_at", 0.0)) <= GEO_CACHE_TTL_S
+        ):
+            return dict(cached.get("value") or {})
+
+    if not allow_online:
+        return None
+
+    value = _geo_lookup_online(ip)
+    if value is None:
+        return None
+
+    with _geo_cache_lock:
+        _geo_cache[ip] = {"cached_at": now, "value": dict(value)}
+    _persist_geo_cache_row(ip, value, now)
+    return dict(value)
+
+
+def _geo_match_area(
+    geo: Dict[str, Any],
+    scope: str,
+    country_code: str,
+    region: str,
+    city: str,
+) -> bool:
+    cc = str(geo.get("country_code") or "").upper()
+    rg = str(geo.get("region") or "").strip().lower()
+    ct = str(geo.get("city") or "").strip().lower()
+
+    if scope == "china" and cc != "CN":
+        return False
+    if country_code and cc != country_code.upper():
+        return False
+    if region and rg != region.strip().lower():
+        return False
+    if city and ct != city.strip().lower():
+        return False
+    return True
+
+
+def _query_recent_alerts_for_ips(
+    conn: sqlite3.Connection, ips: List[str], limit: int
+) -> List[Dict[str, Any]]:
+    if len(ips) == 0 or not _safe_table_exists(conn, ALERT_TABLE):
+        return []
+    placeholders = ",".join(["?" for _ in ips])
+    sql = f"""
+        SELECT id, timestamp, src_ip, dst_ip, threat_category, alert_level, confidence, risk_score
+        FROM {ALERT_TABLE}
+        WHERE src_ip IN ({placeholders})
+        ORDER BY id DESC
+        LIMIT ?
+    """
+    params: List[Any] = [*ips, int(limit)]
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    return [dict(r) for r in cur.fetchall()]
+
+
+def _query_source_ip_counts(
+    conn: sqlite3.Connection,
+    levels: List[str],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    if not _safe_table_exists(conn, ALERT_TABLE):
+        return []
+
+    use_levels = [x for x in levels if x in {"low", "medium", "high"}]
+    if len(use_levels) == 0:
+        use_levels = ["medium", "high"]
+
+    placeholders = ",".join(["?" for _ in use_levels])
+    sql = f"""
+        SELECT src_ip, COUNT(*) AS c
+        FROM {ALERT_TABLE}
+        WHERE alert_level IN ({placeholders})
+          AND src_ip IS NOT NULL
+          AND src_ip != ''
+        GROUP BY src_ip
+        ORDER BY c DESC
+        LIMIT ?
+    """
+    params: List[Any] = [*use_levels, int(limit)]
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    rows = []
+    for r in cur.fetchall():
+        rows.append({"src_ip": str(r[0]), "count": int(r[1])})
+    return rows
+
+
 def _normalize_byte_heatmap(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload, list):
         return payload
@@ -177,6 +456,314 @@ def _normalize_byte_heatmap(payload: Any) -> List[Dict[str, Any]]:
                 )
             return rows
     return []
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        x = float(value)
+        if x != x:  # NaN
+            return default
+        return x
+    except Exception:
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _extract_packet_scores(packet_contrib: Any) -> List[float]:
+    if isinstance(packet_contrib, list):
+        out: List[float] = []
+        for row in packet_contrib:
+            if isinstance(row, dict):
+                out.append(
+                    _safe_float(
+                        row.get("importance", row.get("score_drop", 0.0)),
+                        default=0.0,
+                    )
+                )
+        return out
+
+    if isinstance(packet_contrib, dict):
+        scores = packet_contrib.get("scores")
+        if isinstance(scores, list):
+            return [_safe_float(x, 0.0) for x in scores]
+
+    return []
+
+
+def _extract_heatmap_matrix(byte_heatmap: Any) -> List[List[float]]:
+    if isinstance(byte_heatmap, dict):
+        raw = byte_heatmap.get("byte_heatmap")
+    else:
+        raw = byte_heatmap
+
+    if not isinstance(raw, list):
+        return []
+
+    matrix: List[List[float]] = []
+    for row in raw:
+        if not isinstance(row, list):
+            continue
+        matrix.append([_safe_float(v, 0.0) for v in row])
+    return matrix
+
+
+def _build_rule_based_xai_explain(detail: Dict[str, Any]) -> Dict[str, Any]:
+    confidence = _safe_float(detail.get("confidence"), 0.0)
+    risk_score = _safe_float(detail.get("risk_score"), 0.0)
+    centroid_distance = _safe_float(detail.get("centroid_distance"), 0.0)
+    centroid_threshold = _safe_float(detail.get("centroid_threshold"), 0.0)
+    alert_level = str(detail.get("alert_level") or "low")
+    pred_name = str(detail.get("threat_category") or "unknown")
+    is_unknown = _safe_int(detail.get("is_unknown"), 0)
+
+    ratio = (
+        centroid_distance / centroid_threshold if centroid_threshold > 1e-12 else 0.0
+    )
+
+    packet_scores = _extract_packet_scores(detail.get("packet_contrib"))
+    ranked_packets = sorted(
+        [(i, s) for i, s in enumerate(packet_scores)],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    top_packets = [p for p in ranked_packets if p[1] > 0][:3]
+
+    matrix = _extract_heatmap_matrix(detail.get("byte_heatmap"))
+    top_bytes: List[Dict[str, Any]] = []
+    for p_idx, row in enumerate(matrix):
+        if len(row) == 0:
+            continue
+        max_idx = int(max(range(len(row)), key=lambda i: row[i]))
+        max_val = float(row[max_idx])
+        if max_val <= 0:
+            continue
+        top_bytes.append(
+            {
+                "packet_index": p_idx,
+                "byte_start": max_idx,
+                "byte_end": max_idx,
+                "importance": round(max_val, 6),
+            }
+        )
+    top_bytes.sort(key=lambda x: float(x["importance"]), reverse=True)
+    top_bytes = top_bytes[:3]
+
+    why: List[str] = []
+    why.append(
+        "模型输出置信度 {:.2f}，风险分 {:.3f}，当前告警等级为 {}。".format(
+            confidence,
+            risk_score,
+            alert_level,
+        )
+    )
+    why.append(
+        "embedding 距离比 distance/threshold={:.3f}，{} unknown 判定阈值。".format(
+            ratio,
+            "超过" if is_unknown == 1 else "未超过",
+        )
+    )
+    if len(top_packets) > 0:
+        packet_desc = ", ".join(
+            [f"包#{idx}({score:.3f})" for idx, score in top_packets]
+        )
+        why.append(f"包级贡献主要集中在 {packet_desc}。")
+
+    evidence_refs: List[Dict[str, Any]] = [
+        {
+            "type": "threshold_ratio",
+            "value": round(ratio, 6),
+            "detail": "distance/threshold",
+        },
+        {
+            "type": "predicted_category",
+            "value": pred_name,
+            "detail": "threat_category",
+        },
+    ]
+    for idx, score in top_packets:
+        evidence_refs.append(
+            {
+                "type": "packet_contribution",
+                "value": round(score, 6),
+                "detail": f"packet_index={idx}",
+            }
+        )
+    for row in top_bytes:
+        evidence_refs.append(
+            {
+                "type": "byte_hotspot",
+                "value": float(row["importance"]),
+                "detail": f"packet={row['packet_index']}, byte={row['byte_start']}",
+            }
+        )
+
+    actions = [
+        "复核源/目的 IP 的近期会话行为，确认是否存在突发模式切换。",
+        "结合包级高贡献位置做 DPI 抽样或规则匹配，验证异常触发原因。",
+        "若该类告警持续上升，建议提高该流量源的监控频率并关联终端日志。",
+    ]
+    if is_unknown == 1:
+        actions.insert(0, "该样本已被判为 unknown，建议优先隔离并进行人工复核。")
+
+    caveats = [
+        "当前解释基于模型内部贡献与阈值规则，不能替代完整取证结论。",
+        "当会话包数量较少或噪声较高时，字节热力图局部峰值可能不稳定。",
+    ]
+
+    return {
+        "source": "rule",
+        "summary": "该流量被判定为 {}，{} unknown 阈值，风险分 {:.3f}。".format(
+            pred_name,
+            "超过" if is_unknown == 1 else "未超过",
+            risk_score,
+        ),
+        "why": why,
+        "evidence_refs": evidence_refs,
+        "actions": actions,
+        "caveats": caveats,
+        "confidence": round(min(0.95, max(0.4, confidence * 0.85 + 0.1)), 3),
+        "meta": {
+            "is_unknown": is_unknown,
+            "alert_level": alert_level,
+            "packet_hotspots": [int(x[0]) for x in top_packets],
+            "byte_hotspots": top_bytes,
+        },
+    }
+
+
+def _build_llm_xai_prompt(detail: Dict[str, Any], rule: Dict[str, Any]) -> str:
+    packet_scores = _extract_packet_scores(detail.get("packet_contrib"))
+    top_packets = sorted(
+        [(i, s) for i, s in enumerate(packet_scores)],
+        key=lambda x: x[1],
+        reverse=True,
+    )[:5]
+
+    matrix = _extract_heatmap_matrix(detail.get("byte_heatmap"))
+    top_byte_items: List[Dict[str, Any]] = []
+    for p_idx, row in enumerate(matrix):
+        if len(row) == 0:
+            continue
+        max_idx = int(max(range(len(row)), key=lambda i: row[i]))
+        max_val = float(row[max_idx])
+        top_byte_items.append(
+            {
+                "packet_index": p_idx,
+                "byte_index": max_idx,
+                "importance": round(max_val, 6),
+            }
+        )
+    top_byte_items.sort(key=lambda x: float(x["importance"]), reverse=True)
+    top_byte_items = top_byte_items[:6]
+
+    payload = {
+        "threat_category": detail.get("threat_category"),
+        "alert_level": detail.get("alert_level"),
+        "confidence": _safe_float(detail.get("confidence"), 0.0),
+        "risk_score": _safe_float(detail.get("risk_score"), 0.0),
+        "centroid_distance": _safe_float(detail.get("centroid_distance"), 0.0),
+        "centroid_threshold": _safe_float(detail.get("centroid_threshold"), 0.0),
+        "is_unknown": _safe_int(detail.get("is_unknown"), 0),
+        "top_packets": [
+            {"packet_index": i, "score": round(s, 6)} for i, s in top_packets
+        ],
+        "top_bytes": top_byte_items,
+        "rule_summary": rule.get("summary", ""),
+    }
+
+    return (
+        "请基于如下网络流量可解释特征，生成简洁、可审计的解释结论，并只返回 JSON。\n"
+        "JSON schema: "
+        "{summary:string, why:string[], evidence_refs:[{type:string,value:number|string,detail:string}],"
+        "actions:string[], caveats:string[], confidence:number}\n"
+        f"输入数据: {json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        frag = raw[start : end + 1]
+        try:
+            obj = json.loads(frag)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _normalize_xai_explain_payload(
+    data: Dict[str, Any], fallback: Dict[str, Any]
+) -> Dict[str, Any]:
+    payload = dict(fallback)
+    if not isinstance(data, dict):
+        return payload
+
+    if isinstance(data.get("summary"), str) and data.get("summary").strip():
+        payload["summary"] = str(data.get("summary")).strip()
+
+    if isinstance(data.get("why"), list):
+        payload["why"] = [str(x) for x in data.get("why") if str(x).strip()][:6]
+
+    if isinstance(data.get("actions"), list):
+        payload["actions"] = [str(x) for x in data.get("actions") if str(x).strip()][:8]
+
+    if isinstance(data.get("caveats"), list):
+        payload["caveats"] = [str(x) for x in data.get("caveats") if str(x).strip()][:6]
+
+    if isinstance(data.get("evidence_refs"), list):
+        refs: List[Dict[str, Any]] = []
+        for r in data.get("evidence_refs"):
+            if isinstance(r, dict):
+                refs.append(
+                    {
+                        "type": str(r.get("type") or "evidence"),
+                        "value": r.get("value"),
+                        "detail": str(r.get("detail") or ""),
+                    }
+                )
+        if len(refs) > 0:
+            payload["evidence_refs"] = refs[:10]
+
+    conf = _safe_float(data.get("confidence"), payload.get("confidence", 0.6))
+    payload["confidence"] = round(min(1.0, max(0.0, conf)), 3)
+    return payload
+
+
+def _get_xai_explain_cached(alert_id: int) -> Optional[Dict[str, Any]]:
+    now = time.time()
+    with _xai_explain_cache_lock:
+        item = _xai_explain_cache.get(int(alert_id))
+        if item is None:
+            return None
+        if now - float(item.get("cached_at", 0.0)) > XAI_EXPLAIN_CACHE_TTL_S:
+            _xai_explain_cache.pop(int(alert_id), None)
+            return None
+        return dict(item.get("payload") or {})
+
+
+def _set_xai_explain_cache(alert_id: int, payload: Dict[str, Any]) -> None:
+    with _xai_explain_cache_lock:
+        _xai_explain_cache[int(alert_id)] = {
+            "cached_at": time.time(),
+            "payload": dict(payload),
+        }
 
 
 def _overview_payload() -> Dict[str, Any]:
@@ -293,6 +880,147 @@ def overview() -> Dict[str, Any]:
     return _overview_payload()
 
 
+@app.get("/api/geo/source-heatmap")
+def source_geo_heatmap(
+    scope: str = Query(default="global", pattern="^(global|china)$"),
+    levels: str = Query(default="medium,high"),
+    limit: int = Query(default=120, ge=10, le=500),
+) -> Dict[str, Any]:
+    level_list = [x.strip().lower() for x in str(levels).split(",") if x.strip()]
+
+    conn = _db_conn()
+    try:
+        raw = _query_source_ip_counts(conn, level_list, limit)
+    finally:
+        conn.close()
+
+    points: List[Dict[str, Any]] = []
+    private_count = 0
+    unresolved_count = 0
+    resolved_count = 0
+    online_lookups = 0
+
+    for row in raw:
+        ip = row["src_ip"]
+        cnt = int(row["count"])
+        if not _is_public_ip(ip):
+            private_count += cnt
+            continue
+
+        allow_online = online_lookups < MAX_ONLINE_GEO_LOOKUPS
+        geo = _geo_lookup_cached(ip, allow_online=allow_online)
+        if geo is None:
+            unresolved_count += cnt
+            continue
+        if allow_online:
+            online_lookups += 1
+
+        country_code = str(geo.get("country_code") or "").upper()
+        if scope == "china" and country_code != "CN":
+            continue
+
+        try:
+            lat = float(geo.get("lat"))
+            lon = float(geo.get("lon"))
+        except Exception:
+            unresolved_count += cnt
+            continue
+
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            unresolved_count += cnt
+            continue
+
+        resolved_count += cnt
+        points.append(
+            {
+                "ip": ip,
+                "value": cnt,
+                "lat": lat,
+                "lon": lon,
+                "country": str(geo.get("country") or ""),
+                "country_code": country_code,
+                "region": str(geo.get("region") or ""),
+                "city": str(geo.get("city") or ""),
+                "name": str(geo.get("city") or geo.get("country") or ip),
+            }
+        )
+
+    points.sort(key=lambda x: int(x.get("value", 0)), reverse=True)
+    return {
+        "scope": scope,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "points": points,
+        "stats": {
+            "source_ip_count": len(raw),
+            "point_count": len(points),
+            "resolved_alert_count": int(resolved_count),
+            "private_alert_count": int(private_count),
+            "unresolved_alert_count": int(unresolved_count),
+        },
+    }
+
+
+@app.get("/api/geo/source-drilldown")
+def source_geo_drilldown(
+    scope: str = Query(default="global", pattern="^(global|china)$"),
+    country_code: str = Query(default=""),
+    region: str = Query(default=""),
+    city: str = Query(default=""),
+    levels: str = Query(default="medium,high"),
+    ip_limit: int = Query(default=30, ge=1, le=300),
+    alert_limit: int = Query(default=60, ge=1, le=300),
+) -> Dict[str, Any]:
+    level_list = [x.strip().lower() for x in str(levels).split(",") if x.strip()]
+
+    conn = _db_conn()
+    try:
+        raw = _query_source_ip_counts(conn, level_list, max(500, ip_limit * 4))
+
+        matches: List[Dict[str, Any]] = []
+        for row in raw:
+            ip = row["src_ip"]
+            if not _is_public_ip(ip):
+                continue
+            geo = _geo_lookup_cached(ip, allow_online=False)
+            if geo is None:
+                continue
+            if not _geo_match_area(geo, scope, country_code, region, city):
+                continue
+
+            matches.append(
+                {
+                    "ip": ip,
+                    "count": int(row["count"]),
+                    "country": str(geo.get("country") or ""),
+                    "country_code": str(geo.get("country_code") or "").upper(),
+                    "region": str(geo.get("region") or ""),
+                    "city": str(geo.get("city") or ""),
+                }
+            )
+
+        matches.sort(key=lambda x: int(x.get("count", 0)), reverse=True)
+        top_ips = matches[:ip_limit]
+        alerts = _query_recent_alerts_for_ips(
+            conn,
+            [str(x["ip"]) for x in top_ips],
+            alert_limit,
+        )
+    finally:
+        conn.close()
+
+    return {
+        "scope": scope,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "area": {
+            "country_code": country_code.upper(),
+            "region": region,
+            "city": city,
+        },
+        "top_ips": top_ips,
+        "recent_alerts": alerts,
+    }
+
+
 @app.get("/api/alerts")
 def alerts(
     levels: str = Query(default="medium,high"),
@@ -375,6 +1103,72 @@ def xai_detail(alert_id: int) -> Dict[str, Any]:
         return obj
     finally:
         conn.close()
+
+
+@app.get("/api/xai/explain/{alert_id}")
+def xai_explain(
+    alert_id: int,
+    refresh: bool = Query(default=False),
+) -> Dict[str, Any]:
+    if not refresh:
+        cached = _get_xai_explain_cached(alert_id)
+        if cached is not None:
+            return cached
+
+    detail = xai_detail(alert_id)
+    if not isinstance(detail, dict) or len(detail) == 0:
+        return {
+            "alert_id": int(alert_id),
+            "source": "none",
+            "summary": "未找到可解释样本。",
+            "why": [],
+            "evidence_refs": [],
+            "actions": [],
+            "caveats": [],
+            "confidence": 0.0,
+        }
+
+    rule_payload = _build_rule_based_xai_explain(detail)
+    out = dict(rule_payload)
+    out["alert_id"] = int(alert_id)
+    out["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    ai_cfg = AIConfig.from_env()
+    analyst = TrafficAIAnalyst(ai_cfg)
+    if analyst.available and analyst.client is not None:
+        try:
+            prompt = _build_llm_xai_prompt(detail, rule_payload)
+            resp = analyst.client.chat.completions.create(
+                model=ai_cfg.model,
+                messages=[
+                    {"role": "system", "content": ai_cfg.system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+            )
+            content = ""
+            if resp.choices and resp.choices[0].message:
+                content = resp.choices[0].message.content or ""
+
+            parsed = _extract_json_object(content)
+            merged = _normalize_xai_explain_payload(parsed, rule_payload)
+            out = {
+                **merged,
+                "alert_id": int(alert_id),
+                "source": "llm",
+                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "raw_text": content,
+            }
+        except Exception:
+            out = {
+                **rule_payload,
+                "alert_id": int(alert_id),
+                "source": "rule",
+                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+    _set_xai_explain_cache(alert_id, out)
+    return out
 
 
 @app.get("/api/ai/insights")

@@ -128,12 +128,17 @@ onBeforeUnmount(() => {
   min-height: 100vh;
   display: grid;
   grid-template-columns: 270px 1fr;
+  align-items: start;
   gap: 16px;
   padding: 16px;
 }
 
 .nav-panel {
   padding: 18px 14px;
+  position: sticky;
+  top: 16px;
+  z-index: 4;
+  align-self: start;
 }
 
 .nav-panel h1 {
@@ -161,6 +166,8 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-rows: auto 1fr;
   gap: 12px;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .page-head {
@@ -174,6 +181,8 @@ onBeforeUnmount(() => {
 
 .page-body {
   min-height: 0;
+  min-width: 0;
+  overflow-x: hidden;
 }
 
 @media (max-width: 980px) {

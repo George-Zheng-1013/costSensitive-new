@@ -3,8 +3,11 @@ import {
     getAiInsights,
     getAlerts,
     getModelMetrics,
+    getGeoDrilldown,
     getOverview,
+    getSourceHeatmap,
     getXaiDetail,
+    getXaiExplain,
     getXaiSamples,
 } from '../services/api'
 
@@ -23,9 +26,26 @@ export const useDashboardStore = defineStore('dashboard', {
         alerts: [],
         xaiSamples: [],
         xaiDetail: null,
+        xaiDetailLoading: false,
+        xaiExplain: null,
+        xaiExplainLoading: false,
+        xaiCompareItems: [],
+        xaiCompareLoading: false,
         aiAlertInsights: [],
         aiBehaviorInsights: [],
         modelMetrics: { num_classes: 11, radar: { labels: [], baseline: [], netguard: [] } },
+        geoLoading: false,
+        geoHeatmap: {
+            global: { points: [], stats: {}, updated_at: '' },
+            china: { points: [], stats: {}, updated_at: '' },
+        },
+        geoDrilldownLoading: false,
+        geoDrilldown: {
+            area: null,
+            top_ips: [],
+            recent_alerts: [],
+            updated_at: '',
+        },
         wsStatus: {
             overview: 'idle',
             alerts: 'idle',
@@ -43,6 +63,101 @@ export const useDashboardStore = defineStore('dashboard', {
     },
 
     actions: {
+        _normalizeRadar(radar) {
+            const src = radar && typeof radar === 'object' ? radar : {}
+            const labelsRaw = Array.isArray(src.labels) ? src.labels : []
+            const toNumbers = (arr) => {
+                if (!Array.isArray(arr)) return []
+                return arr.map((v) => {
+                    const n = Number(v)
+                    return Number.isFinite(n) ? n : 0
+                })
+            }
+
+            const baseline = toNumbers(src.baseline)
+            const netguard = toNumbers(src.netguard)
+            const dim = Math.max(labelsRaw.length, baseline.length, netguard.length, 1)
+
+            const labels = Array.from({ length: dim }, (_, i) => {
+                const x = labelsRaw[i]
+                return typeof x === 'string' && x.trim() ? x : `Metric-${i + 1}`
+            })
+
+            const pad = (arr) => {
+                const out = arr.slice(0, dim)
+                while (out.length < dim) out.push(0)
+                return out
+            }
+
+            return {
+                labels,
+                baseline: pad(baseline),
+                netguard: pad(netguard),
+            }
+        },
+
+        _normalizeModelMetrics(metrics) {
+            const src = metrics && typeof metrics === 'object' ? metrics : {}
+            const numClasses = Number(src.num_classes)
+            return {
+                ...src,
+                num_classes: Number.isFinite(numClasses) ? numClasses : 11,
+                radar: this._normalizeRadar(src.radar),
+            }
+        },
+
+        _normalizePacketContrib(xaiDetail) {
+            const payload = xaiDetail?.packet_contrib
+            if (Array.isArray(payload)) {
+                return payload.map((row, idx) => {
+                    const x = row && typeof row === 'object' ? row : {}
+                    const value = Number(x.importance ?? x.score_drop ?? 0)
+                    return {
+                        packet_index: Number.isFinite(Number(x.packet_index)) ? Number(x.packet_index) : idx,
+                        importance: Number.isFinite(value) ? value : 0,
+                    }
+                })
+            }
+            if (payload && typeof payload === 'object' && Array.isArray(payload.scores)) {
+                return payload.scores.map((v, idx) => {
+                    const n = Number(v)
+                    return {
+                        packet_index: idx,
+                        importance: Number.isFinite(n) ? n : 0,
+                    }
+                })
+            }
+            return []
+        },
+
+        _normalizeHeatmapMatrix(xaiDetail) {
+            const payload = xaiDetail?.byte_heatmap
+            const matrix = Array.isArray(payload?.byte_heatmap)
+                ? payload.byte_heatmap
+                : (Array.isArray(payload) ? payload : [])
+
+            if (!Array.isArray(matrix)) {
+                return []
+            }
+            return matrix.map((row) =>
+                (Array.isArray(row) ? row : []).map((v) => {
+                    const n = Number(v)
+                    return Number.isFinite(n) ? n : 0
+                }),
+            )
+        },
+
+        _buildXaiModel(raw) {
+            const detail = raw && typeof raw === 'object' ? raw : {}
+            const packetContrib = this._normalizePacketContrib(detail)
+            const byteHeatmapMatrix = this._normalizeHeatmapMatrix(detail)
+            return {
+                ...detail,
+                packetContrib,
+                byteHeatmapMatrix,
+            }
+        },
+
         _dedupeById(rows) {
             const seen = new Set()
             const out = []
@@ -79,9 +194,62 @@ export const useDashboardStore = defineStore('dashboard', {
                 this.xaiSamples = samplesRes.items || []
                 this.aiAlertInsights = alertInsightsRes.items || []
                 this.aiBehaviorInsights = behaviorInsightsRes.items || []
-                this.modelMetrics = metricsRes || this.modelMetrics
+                this.modelMetrics = this._normalizeModelMetrics(metricsRes || this.modelMetrics)
+                try {
+                    this.geoHeatmap.global = await getSourceHeatmap('global', 120)
+                } catch {
+                    // Keep dashboard usable even if geo service is unavailable.
+                }
             } finally {
                 this.loading = false
+            }
+        },
+
+        async loadGeoHeatmap(scope = 'global', force = false) {
+            const s = scope === 'china' ? 'china' : 'global'
+            const existing = this.geoHeatmap[s]
+            if (!force && Array.isArray(existing?.points) && existing.points.length > 0) {
+                return existing
+            }
+            this.geoLoading = true
+            try {
+                const payload = await getSourceHeatmap(s, 120)
+                this.geoHeatmap[s] = payload || { points: [], stats: {}, updated_at: '' }
+                return this.geoHeatmap[s]
+            } finally {
+                this.geoLoading = false
+            }
+        },
+
+        clearGeoDrilldown() {
+            this.geoDrilldown = {
+                area: null,
+                top_ips: [],
+                recent_alerts: [],
+                updated_at: '',
+            }
+        },
+
+        async loadGeoDrilldown({ scope = 'global', countryCode = '', region = '', city = '' } = {}) {
+            this.geoDrilldownLoading = true
+            try {
+                const payload = await getGeoDrilldown({
+                    scope,
+                    countryCode,
+                    region,
+                    city,
+                    ipLimit: 30,
+                    alertLimit: 60,
+                })
+                this.geoDrilldown = {
+                    area: payload?.area || { country_code: countryCode, region, city },
+                    top_ips: payload?.top_ips || [],
+                    recent_alerts: payload?.recent_alerts || [],
+                    updated_at: payload?.updated_at || '',
+                }
+                return this.geoDrilldown
+            } finally {
+                this.geoDrilldownLoading = false
             }
         },
 
@@ -90,7 +258,68 @@ export const useDashboardStore = defineStore('dashboard', {
                 this.xaiDetail = null
                 return
             }
-            this.xaiDetail = await getXaiDetail(id)
+            this.xaiDetailLoading = true
+            try {
+                const payload = await getXaiDetail(id)
+                this.xaiDetail = this._buildXaiModel(payload)
+            } finally {
+                this.xaiDetailLoading = false
+            }
+        },
+
+        async loadXaiExplain(id, refresh = false) {
+            if (!id) {
+                this.xaiExplain = null
+                return null
+            }
+            this.xaiExplainLoading = true
+            try {
+                const payload = await getXaiExplain(id, refresh)
+                this.xaiExplain = payload || null
+                return this.xaiExplain
+            } finally {
+                this.xaiExplainLoading = false
+            }
+        },
+
+        async loadXaiCompare(ids) {
+            const useIds = Array.isArray(ids)
+                ? [...new Set(ids.map((x) => Number(x)).filter((x) => Number.isFinite(x) && x > 0))]
+                : []
+
+            if (useIds.length === 0) {
+                this.xaiCompareItems = []
+                return []
+            }
+
+            this.xaiCompareLoading = true
+            try {
+                const rows = await Promise.all(
+                    useIds.map(async (id) => {
+                        const raw = await getXaiDetail(id)
+                        const x = this._buildXaiModel(raw)
+                        const contrib = Array.isArray(x.packetContrib) ? x.packetContrib : []
+                        const sorted = [...contrib].sort((a, b) => Number(b.importance || 0) - Number(a.importance || 0))
+                        const topPacket = sorted.length > 0 ? Number(sorted[0].packet_index) : -1
+                        const topImportance = sorted.length > 0 ? Number(sorted[0].importance || 0) : 0
+                        return {
+                            id,
+                            threat_category: String(x.threat_category || '-'),
+                            alert_level: String(x.alert_level || '-'),
+                            confidence: Number(x.confidence || 0),
+                            risk_score: Number(x.risk_score || 0),
+                            is_unknown: Number(x.is_unknown || 0),
+                            top_packet: topPacket,
+                            top_importance: topImportance,
+                            matrix_rows: Array.isArray(x.byteHeatmapMatrix) ? x.byteHeatmapMatrix.length : 0,
+                        }
+                    }),
+                )
+                this.xaiCompareItems = rows
+                return rows
+            } finally {
+                this.xaiCompareLoading = false
+            }
         },
 
         applyOverview(payload) {
