@@ -327,3 +327,5 @@ vite.config.ts.timestamp-*
 /costSensitive/dataset
 /costSensitive/processed_full
 /costSensitive/pytorch_model
+/config/ai_config.json
+netguard_logs.db
