@@ -25,6 +25,27 @@ const geoPayload = computed(() => {
 
 const geoPointCount = computed(() => Number(geoPayload.value?.stats?.point_count || 0))
 const geoResolvedCount = computed(() => Number(geoPayload.value?.stats?.resolved_alert_count || 0))
+const clusterSummary = computed(() => store.unknownClusterSummary || { clusters: [], spikes: [] })
+const clusterRows = computed(() => {
+  const rows = Array.isArray(clusterSummary.value?.clusters) ? clusterSummary.value.clusters : []
+  return rows.slice(0, 8)
+})
+const clusterSeries = computed(() => {
+  const rows = Array.isArray(store.unknownClusterTrend?.series) ? store.unknownClusterTrend.series : []
+  const clusterIds = Array.isArray(store.unknownClusterTrend?.cluster_ids) ? store.unknownClusterTrend.cluster_ids : []
+  if (rows.length === 0 || clusterIds.length === 0) return []
+  const latest = rows[rows.length - 1] || {}
+  return clusterIds.slice(0, 4).map((id) => {
+    const value = Number(latest?.[id] || 0)
+    const max = Math.max(1, ...rows.map((x) => Number(x?.[id] || 0)))
+    return {
+      id,
+      value,
+      pct: (value / max) * 100,
+    }
+  })
+})
+const unknownSpikeCount = computed(() => Number(clusterSummary.value?.spikes?.length || 0))
 const geoAreaLabel = computed(() => {
   const area = store.geoDrilldown?.area
   if (!area) return '未选择'
@@ -34,6 +55,10 @@ const geoAreaLabel = computed(() => {
 
 async function refreshGeo() {
   await store.loadGeoHeatmap(geoScope.value, true)
+}
+
+async function refreshUnknownClusters(rebuild = false) {
+  await store.loadUnknownClusters({ rebuild })
 }
 
 async function onGeoPointClick(payload) {
@@ -47,6 +72,7 @@ async function onGeoPointClick(payload) {
 
 onMounted(async () => {
   await store.loadGeoHeatmap(geoScope.value, false)
+  await store.loadUnknownClusters({ rebuild: false })
 })
 
 watch(
@@ -101,6 +127,53 @@ watch(
       <h3 class="card-title">模型综合指标</h3>
       <p class="muted">当前分类体系: {{ Number(store.modelMetrics.num_classes || 11) }} 类</p>
       <RadarChart :radar="store.modelMetrics.radar" />
+    </section>
+
+    <section class="card chart-card two-col">
+      <div class="cluster-head">
+        <h3 class="card-title">Unknown Cluster 监控</h3>
+        <div class="cluster-actions">
+          <el-tag type="danger" v-if="unknownSpikeCount > 0">突增簇 {{ unknownSpikeCount }}</el-tag>
+          <el-button size="small" :loading="store.unknownClusterLoading" @click="refreshUnknownClusters(true)">
+            重建聚类
+          </el-button>
+          <el-button size="small" :loading="store.unknownClusterLoading" @click="refreshUnknownClusters(false)">
+            刷新
+          </el-button>
+        </div>
+      </div>
+      <div class="cluster-meta muted">
+        <span>未知样本: {{ Number(clusterSummary.total_unknown || 0) }}</span>
+        <span>噪声点: {{ Number(clusterSummary.noise_count || 0) }}</span>
+        <span>更新时间: {{ clusterSummary.generated_at || '-' }}</span>
+      </div>
+      <div class="cluster-grid">
+        <div>
+          <el-table :data="clusterRows" height="220" stripe v-loading="store.unknownClusterLoading">
+            <el-table-column prop="cluster_id" label="簇ID" min-width="130" />
+            <el-table-column prop="size" label="当前规模" width="90" />
+            <el-table-column prop="growth" label="增长" width="80" />
+            <el-table-column label="突增" width="80">
+              <template #default="scope">
+                <el-tag :type="scope.row.is_spike ? 'danger' : 'info'">
+                  {{ scope.row.is_spike ? '是' : '否' }}
+                </el-tag>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+        <div class="cluster-spark">
+          <h4 class="card-title">最新簇强度</h4>
+          <div v-for="row in clusterSeries" :key="row.id" class="cluster-spark-row">
+            <span class="cluster-id" :title="row.id">{{ row.id }}</span>
+            <div class="cluster-bar-wrap">
+              <div class="cluster-bar" :style="{ width: `${row.pct}%` }" />
+            </div>
+            <span class="cluster-val">{{ row.value }}</span>
+          </div>
+          <el-empty v-if="clusterSeries.length === 0" description="暂无聚类趋势" :image-size="68" />
+        </div>
+      </div>
     </section>
 
     <section class="card chart-card geo-card all-col">
@@ -169,6 +242,71 @@ watch(
 
 .geo-card {
   overflow: hidden;
+}
+
+.cluster-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.cluster-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cluster-meta {
+  margin-top: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.cluster-grid {
+  margin-top: 8px;
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  gap: 10px;
+}
+
+.cluster-spark {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  min-width: 0;
+}
+
+.cluster-spark-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 1.5fr auto;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.cluster-id {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cluster-bar-wrap {
+  height: 8px;
+  border-radius: 999px;
+  background: #e8eef8;
+  overflow: hidden;
+}
+
+.cluster-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #f5a524, #d14b4b);
+}
+
+.cluster-val {
+  color: #1f2a44;
+  font-weight: 600;
 }
 
 .geo-head {
@@ -247,6 +385,10 @@ watch(
   }
 
   .geo-drill-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .cluster-grid {
     grid-template-columns: 1fr;
   }
 }

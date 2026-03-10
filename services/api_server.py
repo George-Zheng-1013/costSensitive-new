@@ -2,8 +2,10 @@ import json
 import os
 import asyncio
 import time
+import subprocess
 import ipaddress
 import threading
+import sys
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from urllib import error as urlerror
@@ -51,6 +53,12 @@ _geo_cache_loaded = False
 _xai_explain_cache_lock = threading.Lock()
 _xai_explain_cache: Dict[int, Dict[str, Any]] = {}
 XAI_EXPLAIN_CACHE_TTL_S = 15 * 60
+UNKNOWN_CLUSTER_JSON = os.path.join(
+    PROJECT_ROOT, "costSensitive", "pytorch_model", "unknown_clusters.json"
+)
+UNKNOWN_CLUSTER_HISTORY_JSON = os.path.join(
+    PROJECT_ROOT, "costSensitive", "pytorch_model", "unknown_cluster_history.json"
+)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -137,6 +145,106 @@ def _parse_json(s: Any) -> Any:
         return json.loads(s)
     except Exception:
         return None
+
+
+def _load_unknown_cluster_payload() -> Dict[str, Any]:
+    if not os.path.exists(UNKNOWN_CLUSTER_JSON):
+        return {
+            "generated_at": "",
+            "total_samples": 0,
+            "total_unknown": 0,
+            "noise_count": 0,
+            "config": {},
+            "clusters": [],
+            "assignments": [],
+        }
+    try:
+        with open(UNKNOWN_CLUSTER_JSON, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {
+            "generated_at": "",
+            "total_samples": 0,
+            "total_unknown": 0,
+            "noise_count": 0,
+            "config": {},
+            "clusters": [],
+            "assignments": [],
+        }
+
+
+def _load_unknown_cluster_history() -> List[Dict[str, Any]]:
+    if not os.path.exists(UNKNOWN_CLUSTER_HISTORY_JSON):
+        return []
+    try:
+        with open(UNKNOWN_CLUSTER_HISTORY_JSON, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return raw if isinstance(raw, list) else []
+    except Exception:
+        return []
+
+
+def _run_unknown_cluster_rebuild(
+    eps: float = 0.2,
+    min_samples: int = 4,
+    metric: str = "cosine",
+    l2_normalize: bool = True,
+) -> Dict[str, Any]:
+    script = os.path.join(PROJECT_ROOT, "costSensitive", "cluster_unknown.py")
+    if not os.path.exists(script):
+        return {"ok": False, "error": f"cluster script not found: {script}"}
+
+    cmd = [
+        sys.executable,
+        script,
+        "--embeddings",
+        os.path.join(
+            PROJECT_ROOT, "costSensitive", "pytorch_model", "session_embeddings.npy"
+        ),
+        "--pred-csv",
+        os.path.join(
+            PROJECT_ROOT, "costSensitive", "pytorch_model", "session_predictions.csv"
+        ),
+        "--out-json",
+        UNKNOWN_CLUSTER_JSON,
+        "--history-json",
+        UNKNOWN_CLUSTER_HISTORY_JSON,
+        "--assignment-csv",
+        os.path.join(
+            PROJECT_ROOT,
+            "costSensitive",
+            "pytorch_model",
+            "unknown_cluster_assignments.csv",
+        ),
+        "--eps",
+        str(float(eps)),
+        "--min-samples",
+        str(int(min_samples)),
+        "--metric",
+        str(metric),
+    ]
+    if l2_normalize:
+        cmd.append("--l2-normalize")
+
+    try:
+        p = subprocess.run(
+            cmd,
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    return {
+        "ok": bool(p.returncode == 0),
+        "returncode": int(p.returncode),
+        "stdout": str(p.stdout or "")[-4000:],
+        "stderr": str(p.stderr or "")[-4000:],
+    }
 
 
 def _normalize_packet_contrib(payload: Any) -> List[Dict[str, Any]]:
@@ -1045,6 +1153,113 @@ def source_geo_drilldown(
         },
         "top_ips": top_ips,
         "recent_alerts": alerts,
+    }
+
+
+@app.get("/api/unknown/clusters/summary")
+def unknown_clusters_summary() -> Dict[str, Any]:
+    payload = _load_unknown_cluster_payload()
+    history = _load_unknown_cluster_history()
+
+    latest_hist = (
+        history[-1] if len(history) > 0 and isinstance(history[-1], dict) else {}
+    )
+    prev_sizes = {}
+    if len(history) >= 2 and isinstance(history[-2], dict):
+        prev_sizes = dict(history[-2].get("sizes") or {})
+
+    spikes = {
+        str(x.get("cluster_id")): x
+        for x in (latest_hist.get("spikes") or [])
+        if isinstance(x, dict)
+    }
+
+    clusters = []
+    for row in payload.get("clusters") or []:
+        if not isinstance(row, dict):
+            continue
+        cluster_id = str(row.get("cluster_id") or "")
+        size = int(row.get("size") or 0)
+        prev = int(prev_sizes.get(cluster_id, 0))
+        growth = size - prev
+        growth_ratio = float(size / max(prev, 1)) if size > 0 else 1.0
+        clusters.append(
+            {
+                "cluster_id": cluster_id,
+                "size": size,
+                "prev_size": prev,
+                "growth": growth,
+                "growth_ratio": round(growth_ratio, 4),
+                "is_spike": bool(cluster_id in spikes),
+                "top_pred": row.get("top_pred") or [],
+            }
+        )
+
+    clusters.sort(key=lambda x: int(x.get("size", 0)), reverse=True)
+    return {
+        "generated_at": str(payload.get("generated_at") or ""),
+        "history_points": int(len(history)),
+        "total_samples": int(payload.get("total_samples") or 0),
+        "total_unknown": int(payload.get("total_unknown") or 0),
+        "noise_count": int(payload.get("noise_count") or 0),
+        "config": payload.get("config") or {},
+        "clusters": clusters,
+        "spikes": list(spikes.values()),
+    }
+
+
+@app.get("/api/unknown/clusters/trend")
+def unknown_clusters_trend(
+    limit: int = Query(default=48, ge=1, le=500)
+) -> Dict[str, Any]:
+    history = _load_unknown_cluster_history()
+    if len(history) == 0:
+        return {"series": [], "cluster_ids": []}
+
+    rows = history[-int(limit) :]
+    cluster_ids = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        sizes = row.get("sizes") or {}
+        if isinstance(sizes, dict):
+            for k in sizes.keys():
+                cluster_ids.add(str(k))
+
+    ids = sorted(cluster_ids)
+    series = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        sizes = row.get("sizes") or {}
+        item = {
+            "timestamp": str(row.get("timestamp") or ""),
+            "total_unknown": int(row.get("total_unknown") or 0),
+        }
+        for cid in ids:
+            item[cid] = int((sizes or {}).get(cid, 0))
+        series.append(item)
+
+    return {"series": series, "cluster_ids": ids}
+
+
+@app.get("/api/unknown/clusters/rebuild")
+def unknown_clusters_rebuild(
+    eps: float = Query(default=0.2, gt=0.0),
+    min_samples: int = Query(default=4, ge=2, le=200),
+    metric: str = Query(default="cosine"),
+    l2_normalize: bool = Query(default=True),
+) -> Dict[str, Any]:
+    result = _run_unknown_cluster_rebuild(
+        eps=eps,
+        min_samples=min_samples,
+        metric=metric,
+        l2_normalize=l2_normalize,
+    )
+    summary = unknown_clusters_summary()
+    return {
+        "rebuild": result,
+        "summary": summary,
     }
 
 

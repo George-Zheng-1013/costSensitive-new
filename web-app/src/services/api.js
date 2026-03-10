@@ -64,3 +64,26 @@ export function getGeoDrilldown({
     ].join('&')
     return requestJson(`/api/geo/source-drilldown?${query}`)
 }
+
+export function getUnknownClusterSummary() {
+    return requestJson('/api/unknown/clusters/summary')
+}
+
+export function getUnknownClusterTrend(limit = 48) {
+    return requestJson(`/api/unknown/clusters/trend?limit=${encodeURIComponent(limit)}`)
+}
+
+export function rebuildUnknownClusters({
+    eps = 0.8,
+    minSamples = 8,
+    metric = 'euclidean',
+    l2Normalize = false,
+} = {}) {
+    const query = [
+        `eps=${encodeURIComponent(eps)}`,
+        `min_samples=${encodeURIComponent(minSamples)}`,
+        `metric=${encodeURIComponent(metric)}`,
+        `l2_normalize=${encodeURIComponent(l2Normalize ? '1' : '0')}`,
+    ].join('&')
+    return requestJson(`/api/unknown/clusters/rebuild?${query}`)
+}

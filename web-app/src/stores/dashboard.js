@@ -4,7 +4,10 @@ import {
     getAlerts,
     getModelMetrics,
     getGeoDrilldown,
+    getUnknownClusterSummary,
+    getUnknownClusterTrend,
     getOverview,
+    rebuildUnknownClusters,
     getSourceHeatmap,
     getXaiDetail,
     getXaiExplain,
@@ -45,6 +48,18 @@ export const useDashboardStore = defineStore('dashboard', {
             top_ips: [],
             recent_alerts: [],
             updated_at: '',
+        },
+        unknownClusterLoading: false,
+        unknownClusterSummary: {
+            generated_at: '',
+            total_unknown: 0,
+            noise_count: 0,
+            clusters: [],
+            spikes: [],
+        },
+        unknownClusterTrend: {
+            cluster_ids: [],
+            series: [],
         },
         wsStatus: {
             overview: 'idle',
@@ -200,8 +215,37 @@ export const useDashboardStore = defineStore('dashboard', {
                 } catch {
                     // Keep dashboard usable even if geo service is unavailable.
                 }
+                try {
+                    await this.loadUnknownClusters({ rebuild: false })
+                } catch {
+                    // Keep dashboard usable even if cluster service is unavailable.
+                }
             } finally {
                 this.loading = false
+            }
+        },
+
+        async loadUnknownClusters({ rebuild = false } = {}) {
+            this.unknownClusterLoading = true
+            try {
+                if (rebuild) {
+                    const rebuilt = await rebuildUnknownClusters({
+                        eps: 0.2,
+                        minSamples: 4,
+                        metric: 'cosine',
+                        l2Normalize: true,
+                    })
+                    this.unknownClusterSummary = rebuilt?.summary || this.unknownClusterSummary
+                } else {
+                    this.unknownClusterSummary = await getUnknownClusterSummary()
+                }
+                this.unknownClusterTrend = await getUnknownClusterTrend(48)
+                return {
+                    summary: this.unknownClusterSummary,
+                    trend: this.unknownClusterTrend,
+                }
+            } finally {
+                this.unknownClusterLoading = false
             }
         },
 
