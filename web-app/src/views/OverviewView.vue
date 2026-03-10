@@ -146,9 +146,16 @@ watch(
         </section>
 
         <section class="card chart-card two-col">
-            <h3 class="card-title">模型综合指标</h3>
-            <p class="muted">当前分类体系: {{ Number(store.modelMetrics.num_classes || 11) }} 类</p>
+            <h3 class="card-title">模型综合指标对比 (RF / CNN / NetGuard)</h3>
+            <p class="muted">
+                传统模型 (RF/CNN) 对比当前模型 (NetGuard) | 当前分类体系: {{ Number(store.modelMetrics.num_classes || 11) }} 类
+            </p>
             <RadarChart :radar="store.modelMetrics.radar" />
+            <div class="metric-highlights" v-if="(store.modelMetrics.highlights || []).length > 0">
+                <el-tag v-for="item in store.modelMetrics.highlights" :key="item" type="primary" effect="light">
+                    {{ item }}
+                </el-tag>
+            </div>
         </section>
 
         <section class="card chart-card two-col">
@@ -284,6 +291,13 @@ watch(
 
 .geo-card {
     overflow: hidden;
+}
+
+.metric-highlights {
+    margin-top: 8px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
 }
 
 .cluster-head {

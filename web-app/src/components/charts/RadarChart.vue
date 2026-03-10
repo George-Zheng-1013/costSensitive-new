@@ -5,7 +5,7 @@ import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 const props = defineProps({
   radar: {
     type: Object,
-    default: () => ({ labels: [], baseline: [], netguard: [] }),
+    default: () => ({ labels: [], models: { rf: [], cnn: [], netguard: [] } }),
   },
 })
 
@@ -23,10 +23,13 @@ function toNumberArray(x) {
 function normalizeRadarInput(radar) {
   const src = radar && typeof radar === 'object' ? radar : {}
   const labelsRaw = Array.isArray(src.labels) ? src.labels : []
-  const baseline = toNumberArray(src.baseline)
-  const netguard = toNumberArray(src.netguard)
+  const modelsSrc = src.models && typeof src.models === 'object' ? src.models : {}
+  const legacyBaseline = toNumberArray(src.baseline)
+  const rf = toNumberArray(modelsSrc.rf || legacyBaseline)
+  const cnn = toNumberArray(modelsSrc.cnn)
+  const netguard = toNumberArray(modelsSrc.netguard)
 
-  const dim = Math.max(labelsRaw.length, baseline.length, netguard.length, 1)
+  const dim = Math.max(labelsRaw.length, rf.length, cnn.length, netguard.length, 1)
   const labels = Array.from({ length: dim }, (_, i) => {
     const label = labelsRaw[i]
     return typeof label === 'string' && label.trim() ? label : `Metric-${i + 1}`
@@ -40,7 +43,8 @@ function normalizeRadarInput(radar) {
 
   return {
     labels,
-    baseline: pad(baseline),
+    rf: pad(rf),
+    cnn: pad(cnn),
     netguard: pad(netguard),
   }
 }
@@ -53,30 +57,46 @@ function render() {
   // Keep radar max stable so all values fit even when backend sends out-of-range data.
   const maxVal = Math.max(
     100,
-    ...normalized.baseline,
+    ...normalized.rf,
+    ...normalized.cnn,
     ...normalized.netguard,
   )
 
   chart.setOption({
     animation: false,
-    legend: { data: ['Baseline', 'NetGuard'] },
+    color: ['#7E8CA3', '#C9893A', '#2E6FD8'],
+    legend: {
+      data: ['RF', 'CNN', 'NetGuard (Current)'],
+      bottom: 0,
+    },
     radar: {
       indicator: labels.map((label) => ({ name: label, max: maxVal })),
-      radius: 90,
+      radius: 86,
     },
     series: [
       {
         type: 'radar',
         data: [
           {
-            value: normalized.baseline,
-            name: 'Baseline',
-            areaStyle: { color: 'rgba(245,165,36,.18)' },
+            value: normalized.rf,
+            name: 'RF',
+            symbolSize: 6,
+            lineStyle: { width: 2 },
+            areaStyle: { color: 'rgba(126,140,163,.12)' },
+          },
+          {
+            value: normalized.cnn,
+            name: 'CNN',
+            symbolSize: 6,
+            lineStyle: { width: 2 },
+            areaStyle: { color: 'rgba(201,137,58,.12)' },
           },
           {
             value: normalized.netguard,
-            name: 'NetGuard',
-            areaStyle: { color: 'rgba(46,111,216,.2)' },
+            name: 'NetGuard (Current)',
+            symbolSize: 8,
+            lineStyle: { width: 3.5, shadowBlur: 10, shadowColor: 'rgba(46,111,216,.35)' },
+            areaStyle: { color: 'rgba(46,111,216,.24)' },
           },
         ],
       },

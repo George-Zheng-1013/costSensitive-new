@@ -37,7 +37,11 @@ export const useDashboardStore = defineStore('dashboard', {
         xaiCompareLoading: false,
         aiAlertInsights: [],
         aiBehaviorInsights: [],
-        modelMetrics: { num_classes: 11, radar: { labels: [], baseline: [], netguard: [] } },
+        modelMetrics: {
+            num_classes: 11,
+            highlights: [],
+            radar: { labels: [], models: { rf: [], cnn: [], netguard: [] } },
+        },
         geoLoading: false,
         geoHeatmap: {
             global: { points: [], stats: {}, updated_at: '' },
@@ -96,9 +100,12 @@ export const useDashboardStore = defineStore('dashboard', {
                 })
             }
 
-            const baseline = toNumbers(src.baseline)
-            const netguard = toNumbers(src.netguard)
-            const dim = Math.max(labelsRaw.length, baseline.length, netguard.length, 1)
+            const legacyBaseline = toNumbers(src.baseline)
+            const modelsSrc = src.models && typeof src.models === 'object' ? src.models : {}
+            const rf = toNumbers(modelsSrc.rf || legacyBaseline)
+            const cnn = toNumbers(modelsSrc.cnn)
+            const netguard = toNumbers(modelsSrc.netguard)
+            const dim = Math.max(labelsRaw.length, rf.length, cnn.length, netguard.length, 1)
 
             const labels = Array.from({ length: dim }, (_, i) => {
                 const x = labelsRaw[i]
@@ -113,8 +120,11 @@ export const useDashboardStore = defineStore('dashboard', {
 
             return {
                 labels,
-                baseline: pad(baseline),
-                netguard: pad(netguard),
+                models: {
+                    rf: pad(rf),
+                    cnn: pad(cnn),
+                    netguard: pad(netguard),
+                },
             }
         },
 
@@ -124,6 +134,12 @@ export const useDashboardStore = defineStore('dashboard', {
             return {
                 ...src,
                 num_classes: Number.isFinite(numClasses) ? numClasses : 11,
+                highlights: Array.isArray(src.highlights)
+                    ? src.highlights
+                        .map((x) => String(x || '').trim())
+                        .filter((x) => x.length > 0)
+                        .slice(0, 3)
+                    : [],
                 radar: this._normalizeRadar(src.radar),
             }
         },
