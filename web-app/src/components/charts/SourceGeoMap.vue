@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { echarts } from '../../services/echarts'
+import worldGeoJson from 'geojson-world-map'
 
 const props = defineProps({
   scope: {
@@ -17,9 +18,20 @@ const emit = defineEmits(['point-click'])
 const el = ref(null)
 let chart = null
 
-const MAP_URLS = {
-  world: 'https://geo.datav.aliyun.com/areas_v3/bound/world.geo.json',
-  china: 'https://geo.datav.aliyun.com/areas_v3/bound/100000_full.json',
+const MAP_SOURCES = {
+  world: {
+    local: worldGeoJson,
+    urls: [
+      'https://geo.datav.aliyun.com/areas_v3/bound/world.geo.json',
+      'https://geo.datav.aliyun.com/areas_v3/bound/world.json',
+    ],
+  },
+  china: {
+    urls: [
+      'https://geo.datav.aliyun.com/areas_v3/bound/100000_full.json',
+      'https://geo.datav.aliyun.com/areas_v3/bound/100000.json',
+    ],
+  },
 }
 const mapReady = {
   world: false,
@@ -53,22 +65,38 @@ async function ensureMapRegistered(mapName) {
   if (mapReady[mapName]) {
     return true
   }
-  const url = MAP_URLS[mapName]
-  if (!url) {
+  const source = MAP_SOURCES[mapName]
+  if (!source) {
     return false
   }
-  try {
-    const resp = await fetch(url)
-    if (!resp.ok) {
-      return false
-    }
-    const geoJson = await resp.json()
-    echarts.registerMap(mapName, geoJson)
+
+  const local = source.local
+  if (local && (Array.isArray(local?.features) || local?.type === 'FeatureCollection')) {
+    echarts.registerMap(mapName, local)
     mapReady[mapName] = true
     return true
-  } catch {
-    return false
   }
+
+  const urls = Array.isArray(source.urls) ? source.urls : []
+  for (const url of urls) {
+    try {
+      const resp = await fetch(url)
+      if (!resp.ok) {
+        continue
+      }
+      const geoJson = await resp.json()
+      if (!geoJson || !geoJson.features) {
+        continue
+      }
+      echarts.registerMap(mapName, geoJson)
+      mapReady[mapName] = true
+      return true
+    } catch {
+      // Try next URL fallback.
+    }
+  }
+
+  return false
 }
 
 async function render() {

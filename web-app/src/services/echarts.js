@@ -14,6 +14,7 @@ import {
     GridComponent,
     LegendComponent,
     RadarComponent,
+    TitleComponent,
     TooltipComponent,
     VisualMapComponent,
 } from 'echarts/components'
@@ -29,6 +30,7 @@ use([
     EffectScatterChart,
     HeatmapChart,
     TooltipComponent,
+    TitleComponent,
     LegendComponent,
     GridComponent,
     RadarComponent,
