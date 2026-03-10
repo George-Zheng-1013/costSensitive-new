@@ -14,6 +14,7 @@ const threshold = ref(0)
 
 const detail = computed(() => store.xaiDetail || null)
 const explain = computed(() => store.xaiExplain || null)
+const hasSelection = computed(() => Number.isFinite(Number(selectedId.value)) && Number(selectedId.value) > 0)
 
 const options = computed(() =>
   (Array.isArray(store.xaiSamples) ? store.xaiSamples : []).map((x) => ({
@@ -117,7 +118,14 @@ function onHeatCellClick(payload) {
 watch(
   () => selectedId.value,
   async (v) => {
-    if (!v) return
+    if (!v) {
+      store.xaiDetail = null
+      store.xaiExplain = null
+      selectedPacket.value = -1
+      byteWindow.value = [0, 255]
+      threshold.value = 0
+      return
+    }
     await loadSample(v, false)
   },
 )
@@ -134,10 +142,6 @@ onMounted(async () => {
   if (!store.xaiSamples || store.xaiSamples.length === 0) {
     await store.bootstrap()
   }
-  const first = options.value[0]
-  if (first) {
-    selectedId.value = Number(first.value)
-  }
 })
 </script>
 
@@ -149,14 +153,14 @@ onMounted(async () => {
         <p class="muted">会话级 -> 包级 -> 字节级证据联动，支持 AI 解读与多样本对比。</p>
       </div>
       <div class="toolbar-right">
-        <el-select v-model="selectedId" filterable placeholder="选择告警样本" class="w280">
+        <el-select v-model="selectedId" clearable filterable placeholder="选择告警样本" class="w280">
           <el-option v-for="item in options" :key="item.value" :label="item.label" :value="item.value" />
         </el-select>
-        <el-button :loading="store.xaiExplainLoading" @click="refreshExplain">刷新 AI 解读</el-button>
+        <el-button :loading="store.xaiExplainLoading" :disabled="!hasSelection" @click="refreshExplain">刷新 AI 解读</el-button>
       </div>
     </section>
 
-    <section class="kpi-grid">
+    <section v-if="hasSelection" class="kpi-grid">
       <div class="card panel kpi">
         <div class="muted">最终判定</div>
         <div class="kpi-value">{{ detail?.threat_category || '-' }}</div>
@@ -175,7 +179,7 @@ onMounted(async () => {
       </div>
     </section>
 
-    <section class="chart-grid">
+    <section v-if="hasSelection" class="chart-grid">
       <div class="card panel">
         <h3 class="card-title">包级贡献热区</h3>
         <PacketContributionChart :scores="packetScores" :selected-packet="selectedPacket" @packet-click="selectedPacket = $event" />
@@ -207,7 +211,7 @@ onMounted(async () => {
       </div>
     </section>
 
-    <section class="analysis-grid">
+    <section v-if="hasSelection" class="analysis-grid">
       <div class="card panel">
         <h3 class="card-title">AI 解读与建议</h3>
         <el-skeleton :loading="store.xaiExplainLoading" animated :rows="6">
@@ -238,7 +242,7 @@ onMounted(async () => {
       </div>
     </section>
 
-    <section class="card panel">
+    <section v-if="hasSelection" class="card panel">
       <h3 class="card-title">多样本对比</h3>
       <div class="control-row">
         <el-select v-model="compareIds" multiple filterable collapse-tags placeholder="选择多个样本进行横向对比" class="w420">

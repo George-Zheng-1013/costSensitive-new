@@ -641,38 +641,49 @@ def _query_source_ip_counts(
     return rows
 
 
-def _normalize_byte_heatmap(payload: Any) -> List[Dict[str, Any]]:
-    if isinstance(payload, list):
-        return payload
+def _normalize_byte_heatmap(payload: Any) -> Dict[str, Any]:
+    """Normalize byte heatmap while preserving the full packet-by-byte matrix.
+
+    Returned shape:
+    {
+        "byte_heatmap": List[List[float]],
+        "top_regions": List[Dict[str, Any]]
+    }
+    """
+
+    matrix_raw: Any = None
+
     if isinstance(payload, dict):
-        matrix = payload.get("byte_heatmap")
-        if isinstance(matrix, list):
-            rows: List[Dict[str, Any]] = []
-            for packet_index, row in enumerate(matrix):
-                if not isinstance(row, list) or len(row) == 0:
-                    continue
-                max_idx = 0
-                max_val = float("-inf")
-                for i, v in enumerate(row):
-                    try:
-                        fv = float(v)
-                    except Exception:
-                        fv = 0.0
-                    if fv > max_val:
-                        max_val = fv
-                        max_idx = i
-                rows.append(
-                    {
-                        "packet_index": packet_index,
-                        "byte_start": max_idx,
-                        "byte_end": max_idx,
-                        "importance": round(
-                            max_val if max_val != float("-inf") else 0.0, 6
-                        ),
-                    }
-                )
-            return rows
-    return []
+        matrix_raw = payload.get("byte_heatmap")
+    elif isinstance(payload, list):
+        matrix_raw = payload
+
+    matrix: List[List[float]] = []
+    if isinstance(matrix_raw, list):
+        for row in matrix_raw:
+            if not isinstance(row, list):
+                continue
+            matrix.append([_safe_float(v, 0.0) for v in row])
+
+    top_regions: List[Dict[str, Any]] = []
+    for packet_index, row in enumerate(matrix):
+        if len(row) == 0:
+            continue
+        max_idx = int(max(range(len(row)), key=lambda i: row[i]))
+        max_val = float(row[max_idx])
+        top_regions.append(
+            {
+                "packet_index": packet_index,
+                "byte_start": max_idx,
+                "byte_end": max_idx,
+                "importance": round(max_val, 6),
+            }
+        )
+
+    return {
+        "byte_heatmap": matrix,
+        "top_regions": top_regions,
+    }
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
