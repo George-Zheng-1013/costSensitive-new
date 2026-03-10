@@ -1,35 +1,40 @@
-# web-app
+# NetGuard Web App (Vue3 + Vite)
 
-This template should help get you started developing with Vue 3 in Vite.
+前端负责展示加密流量检测的在线看板，连接后端 `FastAPI` 的 `/api/*` 接口。
 
-## Recommended IDE Setup
+## 页面说明
 
-[VSCode](https://code.visualstudio.com/) + [Volar](https://marketplace.visualstudio.com/items?itemName=Vue.volar) (and disable Vetur).
+- `Overview`：总体态势、地理来源热力图、Unknown Cluster 监控
+- `Alerts`：告警表格与筛选
+- `XAI`：样本级可解释分析（包级贡献、字节热力图、可疑模式聚类、AI 解释）
+- `AI Insights`：规则与模型输出的文本化洞察
 
-## Customize configuration
+## 目录结构
 
-See [Vite Configuration Reference](https://vite.dev/config/).
+- `src/views/`：页面级视图
+- `src/components/charts/`：ECharts 图表组件
+- `src/stores/dashboard.js`：全局状态与 API 调用编排
+- `src/services/api.js`：后端接口封装
+- `src/layout/AppShell.vue`：主布局与导航
 
-## Project Setup
+## 开发启动
 
-```sh
+```bash
 npm install
-```
-
-### Compile and Hot-Reload for Development
-
-```sh
 npm run dev
 ```
 
-### Compile and Minify for Production
+默认 Vite 地址通常为 `http://localhost:5173`。
 
-```sh
+## 构建与检查
+
+```bash
 npm run build
-```
-
-### Lint with [ESLint](https://eslint.org/)
-
-```sh
 npm run lint
 ```
+
+## 交互约定
+
+- XAI 页面默认仅显示工作台；选择具体流量样本后才展示详细分析内容。
+- Unknown Cluster 区域支持手动刷新与重建聚类。
+- 地理来源支持全局/中国范围切换及区域钻取。
