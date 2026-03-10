@@ -244,7 +244,14 @@ class SinglePipelineRunner:
                 emb_i = emb[i].detach().cpu().numpy()
                 decision = self.detector.decide(emb_i, pred_id)
 
-            is_unknown = bool(decision.is_unknown) if decision is not None else False
+            unknown_level = int(decision.unknown_level) if decision is not None else 0
+            unknown_state = (
+                str(decision.unknown_state) if decision is not None else "known"
+            )
+            is_suspected = (
+                int(bool(decision.is_suspected)) if decision is not None else 0
+            )
+            is_unknown = 1 if unknown_level == 2 else 0
             final_pred = -1 if is_unknown else pred_id
             final_pred_name = (
                 self.unknown_label
@@ -261,9 +268,9 @@ class SinglePipelineRunner:
                 float(decision.anomaly_score) if decision is not None else 0.0
             )
 
-            if anomaly_score >= 1.5:
+            if unknown_level >= 2:
                 alert_level = "high"
-            elif anomaly_score >= 1.0:
+            elif unknown_level == 1:
                 alert_level = "medium"
             else:
                 alert_level = "low"
@@ -307,7 +314,10 @@ class SinglePipelineRunner:
                 "centroid_distance": centroid_distance,
                 "centroid_threshold": centroid_threshold,
                 "anomaly_score": anomaly_score,
-                "is_unknown": int(is_unknown),
+                "unknown_level": unknown_level,
+                "unknown_state": unknown_state,
+                "is_suspected": is_suspected,
+                "is_unknown": is_unknown,
                 "final_pred": final_pred,
                 "final_pred_name": final_pred_name,
                 "alert_level": alert_level,
@@ -346,6 +356,9 @@ class SinglePipelineRunner:
                         else ""
                     ),
                     f"{record['anomaly_score']:.6f}",
+                    record["unknown_level"],
+                    record["unknown_state"],
+                    record["is_suspected"],
                     record["is_unknown"],
                     record["final_pred"],
                     record["final_pred_name"],
@@ -410,6 +423,9 @@ class SinglePipelineRunner:
                     "centroid_distance",
                     "centroid_threshold",
                     "anomaly_score",
+                    "unknown_level",
+                    "unknown_state",
+                    "is_suspected",
                     "is_unknown",
                     "final_pred",
                     "final_pred_name",

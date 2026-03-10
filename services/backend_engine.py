@@ -268,13 +268,9 @@ def normalize_timestamp(record: Dict) -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def normalize_alert_level(anomaly_score: float, raw_level: Optional[str]) -> str:
+def normalize_alert_level(raw_level: Optional[str]) -> str:
     if isinstance(raw_level, str) and raw_level in {"low", "medium", "high"}:
         return raw_level
-    if anomaly_score >= HIGH_THRESHOLD:
-        return "high"
-    if anomaly_score >= MEDIUM_THRESHOLD:
-        return "medium"
     return "low"
 
 
@@ -285,6 +281,9 @@ def build_explainability(
     threat_category: str,
     centroid_distance: float,
     centroid_threshold: float,
+    unknown_level: int,
+    unknown_state: str,
+    is_suspected: int,
     is_unknown: int,
 ) -> Tuple[str, str]:
     if centroid_threshold > 1e-12:
@@ -292,10 +291,15 @@ def build_explainability(
     else:
         distance_ratio = 0.0
 
-    if is_unknown == 1:
+    if unknown_level >= 2:
         reason = (
-            "判为 unknown：会话 embedding 到预测类中心距离超过阈值，"
+            "判为 confirmed unknown：会话 embedding 到预测类中心距离显著超过阈值，"
             f"distance/threshold={distance_ratio:.3f}，且风险分={risk_score:.3f}。"
+        )
+    elif unknown_level == 1 or is_suspected == 1:
+        reason = (
+            "判为 suspected：会话 embedding 已超过已知类稳定范围，"
+            f"distance/threshold={distance_ratio:.3f}，保留原预测类别并标记低置信漂移。"
         )
     else:
         reason = (
@@ -311,13 +315,14 @@ def build_explainability(
         "centroid_distance": round(centroid_distance, 6),
         "centroid_threshold": round(centroid_threshold, 6),
         "distance_ratio": round(distance_ratio, 6),
+        "unknown_level": int(unknown_level),
+        "unknown_state": str(unknown_state),
+        "is_suspected": int(is_suspected),
         "is_unknown": int(is_unknown),
         "rules": {
-            "unknown_if_distance_gt_threshold": bool(
-                centroid_distance > centroid_threshold
-            ),
-            "high_if_risk_ge": HIGH_THRESHOLD,
-            "medium_if_risk_ge": MEDIUM_THRESHOLD,
+            "level0_known_if_score_lt": MEDIUM_THRESHOLD,
+            "level1_suspected_if_score_ge": MEDIUM_THRESHOLD,
+            "level2_confirmed_unknown_if_score_ge": HIGH_THRESHOLD,
         },
     }
     return reason, json.dumps(evidence, ensure_ascii=False)
@@ -372,11 +377,23 @@ def convert_record(
         centroid_threshold = 0.0
 
     try:
+        unknown_level = int(record.get("unknown_level", 0))
+    except Exception:
+        unknown_level = 0
+
+    unknown_state = str(record.get("unknown_state", "known"))
+
+    try:
+        is_suspected = int(record.get("is_suspected", 0))
+    except Exception:
+        is_suspected = 0
+
+    try:
         is_unknown = int(record.get("is_unknown", 0))
     except Exception:
         is_unknown = 0
 
-    alert_level = normalize_alert_level(risk_score, record.get("alert_level"))
+    alert_level = normalize_alert_level(record.get("alert_level"))
     explain_reason, evidence_json = build_explainability(
         confidence=confidence,
         risk_score=risk_score,
@@ -384,6 +401,9 @@ def convert_record(
         threat_category=threat_category,
         centroid_distance=centroid_distance,
         centroid_threshold=centroid_threshold,
+        unknown_level=unknown_level,
+        unknown_state=unknown_state,
+        is_suspected=is_suspected,
         is_unknown=is_unknown,
     )
     packet_contrib_json = str(record.get("packet_contrib_json", "") or "")

@@ -188,16 +188,23 @@ def main():
                 emb_i = emb[i].detach().cpu().numpy()
                 decision = detector.decide(emb_i, pred_id) if detector.enabled else None
 
-                is_unknown = (
-                    bool(decision.is_unknown) if decision is not None else False
+                unknown_level = (
+                    int(decision.unknown_level) if decision is not None else 0
                 )
-                if is_unknown:
+                unknown_state = (
+                    str(decision.unknown_state) if decision is not None else "known"
+                )
+                is_suspected = (
+                    int(bool(decision.is_suspected)) if decision is not None else 0
+                )
+                is_unknown = int(unknown_level == 2)
+                if is_unknown == 1:
                     unknown_count += 1
 
-                final_pred = -1 if is_unknown else pred_id
+                final_pred = -1 if is_unknown == 1 else pred_id
                 final_pred_name = (
                     args.unknown_label
-                    if is_unknown
+                    if is_unknown == 1
                     else label_map.get(pred_id, str(pred_id))
                 )
 
@@ -224,7 +231,10 @@ def main():
                             if decision is not None
                             else 0.0
                         ),
-                        "is_unknown": int(is_unknown),
+                        "unknown_level": unknown_level,
+                        "unknown_state": unknown_state,
+                        "is_suspected": is_suspected,
+                        "is_unknown": is_unknown,
                         "final_pred": final_pred,
                         "final_pred_name": final_pred_name,
                     }
@@ -254,6 +264,9 @@ def main():
                 "centroid_distance",
                 "centroid_threshold",
                 "anomaly_score",
+                "unknown_level",
+                "unknown_state",
+                "is_suspected",
                 "is_unknown",
                 "final_pred",
                 "final_pred_name",
@@ -277,6 +290,9 @@ def main():
                     f"{row['centroid_distance']:.6f}",
                     f"{row['centroid_threshold']:.6f}",
                     f"{row['anomaly_score']:.6f}",
+                    row["unknown_level"],
+                    row["unknown_state"],
+                    row["is_suspected"],
                     row["is_unknown"],
                     row["final_pred"],
                     row["final_pred_name"],
@@ -297,6 +313,16 @@ def main():
         "confusion_matrix": conf_mat.tolist(),
         "unknown_count": int(unknown_count),
         "unknown_rate": (unknown_count / total if total > 0 else 0.0),
+        "suspected_count": int(
+            sum(1 for r in all_rows if int(r["unknown_level"]) == 1)
+        ),
+        "level_dist": {
+            "known": int(sum(1 for r in all_rows if int(r["unknown_level"]) == 0)),
+            "suspected": int(sum(1 for r in all_rows if int(r["unknown_level"]) == 1)),
+            "confirmed_unknown": int(
+                sum(1 for r in all_rows if int(r["unknown_level"]) == 2)
+            ),
+        },
         "detector_enabled": bool(detector.enabled),
         "detector_json": args.detector_json,
         "unknown_label": args.unknown_label,

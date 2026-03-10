@@ -12,6 +12,9 @@ class DetectorDecision:
     centroid_distance: float
     centroid_threshold: float
     anomaly_score: float
+    unknown_level: int
+    unknown_state: str
+    is_suspected: bool
     is_unknown: bool
 
 
@@ -21,6 +24,8 @@ class CentroidUnknownDetector:
         self.enabled = False
         self.l2_normalize = True
         self.quantile = 0.95
+        self.suspected_score_threshold = 1.0
+        self.confirmed_score_threshold = 1.5
         self.centroids: Dict[int, np.ndarray] = {}
         self.thresholds: Dict[int, float] = {}
 
@@ -36,6 +41,12 @@ class CentroidUnknownDetector:
 
         self.l2_normalize = bool(raw.get("l2_normalize", True))
         self.quantile = float(raw.get("distance_quantile", 0.95))
+        self.suspected_score_threshold = float(
+            raw.get("suspected_score_threshold", 1.0)
+        )
+        self.confirmed_score_threshold = float(
+            raw.get("confirmed_score_threshold", 1.5)
+        )
 
         classes = raw.get("classes", {})
         self.centroids = {}
@@ -78,17 +89,33 @@ class CentroidUnknownDetector:
                 centroid_distance=float("nan"),
                 centroid_threshold=threshold,
                 anomaly_score=0.0,
+                unknown_level=0,
+                unknown_state="known",
+                is_suspected=False,
                 is_unknown=False,
             )
 
         denom = threshold if threshold > 1e-12 else 1.0
         score = float(distance / denom)
-        is_unknown = bool(distance > threshold)
+        if score >= self.confirmed_score_threshold:
+            unknown_level = 2
+            unknown_state = "confirmed_unknown"
+        elif score >= self.suspected_score_threshold:
+            unknown_level = 1
+            unknown_state = "suspected"
+        else:
+            unknown_level = 0
+            unknown_state = "known"
+
+        is_unknown = bool(unknown_level == 2)
         return DetectorDecision(
             pred_id=pred_id,
             centroid_distance=float(distance),
             centroid_threshold=float(threshold),
             anomaly_score=score,
+            unknown_level=unknown_level,
+            unknown_state=unknown_state,
+            is_suspected=bool(unknown_level == 1),
             is_unknown=is_unknown,
         )
 
@@ -104,6 +131,8 @@ def build_centroid_detector_dict(
     labels: np.ndarray,
     distance_quantile: float = 0.95,
     l2_normalize: bool = True,
+    suspected_score_threshold: float = 1.0,
+    confirmed_score_threshold: float = 1.5,
 ) -> dict:
     if embeddings.ndim != 2:
         raise ValueError("embeddings must be rank-2 [N, D]")
@@ -147,6 +176,8 @@ def build_centroid_detector_dict(
         "distance_metric": "l2",
         "distance_quantile": float(distance_quantile),
         "l2_normalize": bool(l2_normalize),
+        "suspected_score_threshold": float(suspected_score_threshold),
+        "confirmed_score_threshold": float(confirmed_score_threshold),
         "embedding_dim": int(x.shape[1]),
         "num_classes": int(len(classes)),
         "classes": classes,

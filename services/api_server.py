@@ -520,7 +520,13 @@ def _build_rule_based_xai_explain(detail: Dict[str, Any]) -> Dict[str, Any]:
     centroid_threshold = _safe_float(detail.get("centroid_threshold"), 0.0)
     alert_level = str(detail.get("alert_level") or "low")
     pred_name = str(detail.get("threat_category") or "unknown")
-    is_unknown = _safe_int(detail.get("is_unknown"), 0)
+    evidence = (
+        detail.get("evidence") if isinstance(detail.get("evidence"), dict) else {}
+    )
+    unknown_level = _safe_int(evidence.get("unknown_level"), 0)
+    unknown_state = str(evidence.get("unknown_state") or "known")
+    is_suspected = _safe_int(evidence.get("is_suspected"), 0)
+    is_unknown = _safe_int(evidence.get("is_unknown"), 0)
 
     ratio = (
         centroid_distance / centroid_threshold if centroid_threshold > 1e-12 else 0.0
@@ -562,11 +568,14 @@ def _build_rule_based_xai_explain(detail: Dict[str, Any]) -> Dict[str, Any]:
             alert_level,
         )
     )
+    if unknown_level >= 2:
+        state_desc = "已达到 confirmed unknown"
+    elif unknown_level == 1 or is_suspected == 1:
+        state_desc = "处于 suspected 漂移区间"
+    else:
+        state_desc = "处于已知流量区间"
     why.append(
-        "embedding 距离比 distance/threshold={:.3f}，{} unknown 判定阈值。".format(
-            ratio,
-            "超过" if is_unknown == 1 else "未超过",
-        )
+        "embedding 距离比 distance/threshold={:.3f}，当前{}。".format(ratio, state_desc)
     )
     if len(top_packets) > 0:
         packet_desc = ", ".join(
@@ -608,20 +617,26 @@ def _build_rule_based_xai_explain(detail: Dict[str, Any]) -> Dict[str, Any]:
         "结合包级高贡献位置做 DPI 抽样或规则匹配，验证异常触发原因。",
         "若该类告警持续上升，建议提高该流量源的监控频率并关联终端日志。",
     ]
-    if is_unknown == 1:
+    if unknown_level >= 2:
         actions.insert(0, "该样本已被判为 unknown，建议优先隔离并进行人工复核。")
+    elif unknown_level == 1 or is_suspected == 1:
+        actions.insert(0, "该样本为 suspected 漂移，建议保留业务放行并提升监控等级。")
 
     caveats = [
         "当前解释基于模型内部贡献与阈值规则，不能替代完整取证结论。",
         "当会话包数量较少或噪声较高时，字节热力图局部峰值可能不稳定。",
     ]
 
+    state_text = "已知流量"
+    if unknown_level >= 2:
+        state_text = "确认未知流量"
+    elif unknown_level == 1 or is_suspected == 1:
+        state_text = "疑似漂移流量"
+
     return {
         "source": "rule",
-        "summary": "该流量被判定为 {}，{} unknown 阈值，风险分 {:.3f}。".format(
-            pred_name,
-            "超过" if is_unknown == 1 else "未超过",
-            risk_score,
+        "summary": "该流量判定为{}（{}），风险分 {:.3f}。".format(
+            state_text, pred_name, risk_score
         ),
         "why": why,
         "evidence_refs": evidence_refs,
@@ -629,6 +644,9 @@ def _build_rule_based_xai_explain(detail: Dict[str, Any]) -> Dict[str, Any]:
         "caveats": caveats,
         "confidence": round(min(0.95, max(0.4, confidence * 0.85 + 0.1)), 3),
         "meta": {
+            "unknown_level": unknown_level,
+            "unknown_state": unknown_state,
+            "is_suspected": is_suspected,
             "is_unknown": is_unknown,
             "alert_level": alert_level,
             "packet_hotspots": [int(x[0]) for x in top_packets],
@@ -669,7 +687,16 @@ def _build_llm_xai_prompt(detail: Dict[str, Any], rule: Dict[str, Any]) -> str:
         "risk_score": _safe_float(detail.get("risk_score"), 0.0),
         "centroid_distance": _safe_float(detail.get("centroid_distance"), 0.0),
         "centroid_threshold": _safe_float(detail.get("centroid_threshold"), 0.0),
-        "is_unknown": _safe_int(detail.get("is_unknown"), 0),
+        "unknown_level": _safe_int(
+            (detail.get("evidence") or {}).get("unknown_level"), 0
+        ),
+        "unknown_state": str(
+            (detail.get("evidence") or {}).get("unknown_state") or "known"
+        ),
+        "is_suspected": _safe_int(
+            (detail.get("evidence") or {}).get("is_suspected"), 0
+        ),
+        "is_unknown": _safe_int((detail.get("evidence") or {}).get("is_unknown"), 0),
         "top_packets": [
             {"packet_index": i, "score": round(s, 6)} for i, s in top_packets
         ],
