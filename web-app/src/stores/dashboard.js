@@ -7,6 +7,7 @@ import {
     getUnknownClusterSummary,
     getUnknownClusterTrend,
     getOverview,
+    getUnknownClusterAiHints,
     rebuildUnknownClusters,
     getSourceHeatmap,
     getXaiDetail,
@@ -60,6 +61,12 @@ export const useDashboardStore = defineStore('dashboard', {
         unknownClusterTrend: {
             cluster_ids: [],
             series: [],
+        },
+        unknownClusterAiHints: {
+            source: 'none',
+            items: [],
+            by_id: {},
+            generated_at: '',
         },
         wsStatus: {
             overview: 'idle',
@@ -240,9 +247,25 @@ export const useDashboardStore = defineStore('dashboard', {
                     this.unknownClusterSummary = await getUnknownClusterSummary()
                 }
                 this.unknownClusterTrend = await getUnknownClusterTrend(48)
+                const hintLimit = Math.max(1, Number(this.unknownClusterSummary?.clusters?.length || 0))
+                const hintPayload = await getUnknownClusterAiHints(Math.min(hintLimit, 8))
+                const items = Array.isArray(hintPayload?.items) ? hintPayload.items : []
+                const byId = {}
+                for (const row of items) {
+                    const cid = String(row?.cluster_id || '')
+                    if (!cid) continue
+                    byId[cid] = row
+                }
+                this.unknownClusterAiHints = {
+                    source: String(hintPayload?.source || 'none'),
+                    items,
+                    by_id: byId,
+                    generated_at: String(hintPayload?.generated_at || ''),
+                }
                 return {
                     summary: this.unknownClusterSummary,
                     trend: this.unknownClusterTrend,
+                    hints: this.unknownClusterAiHints,
                 }
             } finally {
                 this.unknownClusterLoading = false

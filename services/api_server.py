@@ -247,6 +247,115 @@ def _run_unknown_cluster_rebuild(
     }
 
 
+def _cluster_risk_rank(level: str) -> int:
+    lv = str(level or "").lower()
+    if lv == "critical":
+        return 4
+    if lv == "high":
+        return 3
+    if lv == "medium":
+        return 2
+    return 1
+
+
+def _rule_cluster_hint(row: Dict[str, Any]) -> Dict[str, Any]:
+    top_pred = row.get("top_pred") or []
+    size = int(row.get("size") or 0)
+    growth = int(row.get("growth") or 0)
+    growth_ratio = float(row.get("growth_ratio") or 1.0)
+    is_spike = bool(row.get("is_spike"))
+
+    top_name = "unknown"
+    top_count = 0
+    if (
+        isinstance(top_pred, list)
+        and len(top_pred) > 0
+        and isinstance(top_pred[0], dict)
+    ):
+        top_name = str(top_pred[0].get("pred_name") or "unknown")
+        top_count = int(top_pred[0].get("count") or 0)
+
+    risk_level = "low"
+    if is_spike or growth >= 20 or growth_ratio >= 2.0:
+        risk_level = "high"
+    elif growth >= 8 or growth_ratio >= 1.4:
+        risk_level = "medium"
+
+    if size >= 120:
+        risk_level = "critical"
+    elif size >= 60 and _cluster_risk_rank(risk_level) < _cluster_risk_rank("high"):
+        risk_level = "high"
+
+    possible_type = f"疑似{top_name}相关流量"
+    summary = f"主导标签 {top_name}({top_count})，" f"规模 {size}，增长 {growth}，" + (
+        "出现突增" if is_spike else "暂无突增"
+    )
+
+    return {
+        "cluster_id": str(row.get("cluster_id") or ""),
+        "possible_type": possible_type,
+        "risk_level": risk_level,
+        "summary": summary,
+        "confidence": 0.55,
+    }
+
+
+def _merge_cluster_hints(
+    clusters: List[Dict[str, Any]], ai_items: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    by_id = {}
+    for x in ai_items or []:
+        if not isinstance(x, dict):
+            continue
+        cid = str(x.get("cluster_id") or "")
+        if cid:
+            by_id[cid] = x
+
+    items = []
+    llm_count = 0
+    for row in clusters:
+        cid = str(row.get("cluster_id") or "")
+        base = _rule_cluster_hint(row)
+        ai_row = by_id.get(cid)
+        if isinstance(ai_row, dict):
+            risk = str(ai_row.get("risk_level") or base["risk_level"]).lower()
+            if risk not in {"low", "medium", "high", "critical"}:
+                risk = base["risk_level"]
+            try:
+                conf = float(ai_row.get("confidence", base["confidence"]))
+            except Exception:
+                conf = float(base["confidence"])
+            conf = max(0.0, min(1.0, conf))
+            item = {
+                **base,
+                "possible_type": str(
+                    ai_row.get("possible_type") or base["possible_type"]
+                ),
+                "risk_level": risk,
+                "summary": str(ai_row.get("summary") or base["summary"]),
+                "confidence": conf,
+                "source": "llm",
+            }
+            llm_count += 1
+        else:
+            item = {
+                **base,
+                "source": "rule",
+            }
+        items.append(item)
+
+    if len(items) == 0:
+        source = "none"
+    elif llm_count == 0:
+        source = "rule"
+    elif llm_count == len(items):
+        source = "llm"
+    else:
+        source = "mixed"
+
+    return {"items": items, "source": source, "llm_count": llm_count}
+
+
 def _normalize_packet_contrib(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload, list):
         return payload
@@ -1260,6 +1369,27 @@ def unknown_clusters_rebuild(
     return {
         "rebuild": result,
         "summary": summary,
+    }
+
+
+@app.get("/api/unknown/clusters/ai-hints")
+def unknown_clusters_ai_hints(
+    limit: int = Query(default=8, ge=1, le=50),
+) -> Dict[str, Any]:
+    summary = unknown_clusters_summary()
+    clusters = list(summary.get("clusters") or [])[: int(limit)]
+
+    ai_cfg = AIConfig.from_env()
+    analyst = TrafficAIAnalyst(ai_cfg)
+    ai_items = analyst.analyze_unknown_clusters(clusters)
+    merged = _merge_cluster_hints(clusters, ai_items)
+
+    return {
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "available": bool(analyst.available),
+        "source": merged.get("source"),
+        "llm_count": int(merged.get("llm_count") or 0),
+        "items": merged.get("items") or [],
     }
 
 

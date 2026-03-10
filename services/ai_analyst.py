@@ -218,3 +218,80 @@ class TrafficAIAnalyst:
     def analyze(self, records: List[Dict]) -> Dict:
         # Backward-compatible alias for existing call sites.
         return self.analyze_alerts(records)
+
+    def analyze_unknown_clusters(self, clusters: List[Dict]) -> List[Dict]:
+        if not self.available or self.client is None:
+            return []
+
+        normalized = []
+        for row in clusters[:20]:
+            if not isinstance(row, dict):
+                continue
+            cid = str(row.get("cluster_id") or "")
+            if not cid:
+                continue
+            normalized.append(
+                {
+                    "cluster_id": cid,
+                    "size": int(row.get("size") or 0),
+                    "growth": int(row.get("growth") or 0),
+                    "growth_ratio": float(row.get("growth_ratio") or 1.0),
+                    "is_spike": bool(row.get("is_spike")),
+                    "top_pred": row.get("top_pred") or [],
+                }
+            )
+
+        if len(normalized) == 0:
+            return []
+
+        user_prompt = (
+            "请基于未知簇摘要做快速研判，并仅输出 JSON。\n"
+            "JSON schema: {items: [{cluster_id: string, possible_type: string, "
+            "risk_level: low|medium|high|critical, summary: string, confidence: number(0~1)}]}\n"
+            "要求: summary 不超过 50 字，必须简洁。\n"
+            f"输入簇摘要: {json.dumps(normalized, ensure_ascii=False)}"
+        )
+
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.cfg.model,
+                messages=[
+                    {"role": "system", "content": self.cfg.system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+            )
+            content = ""
+            if resp.choices and resp.choices[0].message:
+                content = resp.choices[0].message.content or ""
+            parsed = self._extract_json(content)
+            if not isinstance(parsed, dict):
+                return []
+            items = parsed.get("items")
+            if not isinstance(items, list):
+                return []
+            out = []
+            for x in items:
+                if not isinstance(x, dict):
+                    continue
+                cid = str(x.get("cluster_id") or "")
+                risk = str(x.get("risk_level") or "medium").lower()
+                if risk not in {"low", "medium", "high", "critical"}:
+                    risk = "medium"
+                try:
+                    conf = float(x.get("confidence", 0.55) or 0.55)
+                except Exception:
+                    conf = 0.55
+                conf = max(0.0, min(1.0, conf))
+                out.append(
+                    {
+                        "cluster_id": cid,
+                        "possible_type": str(x.get("possible_type") or "未知加密业务"),
+                        "risk_level": risk,
+                        "summary": str(x.get("summary") or "未知簇行为待确认"),
+                        "confidence": conf,
+                    }
+                )
+            return out
+        except Exception:
+            return []

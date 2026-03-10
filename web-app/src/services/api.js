@@ -87,3 +87,7 @@ export function rebuildUnknownClusters({
     ].join('&')
     return requestJson(`/api/unknown/clusters/rebuild?${query}`)
 }
+
+export function getUnknownClusterAiHints(limit = 8) {
+    return requestJson(`/api/unknown/clusters/ai-hints?limit=${encodeURIComponent(limit)}`)
+}
