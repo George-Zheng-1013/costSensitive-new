@@ -1,0 +1,10 @@
+{
+    "enabled": true,
+    "api_key": "sk-bhbgvzuyrhcnmqzobtjdrahvdijaaorhqqomqlslsllpynpj",
+    "base_url": "https://api.siliconflow.cn/v1",
+    "model": "Pro/deepseek-ai/DeepSeek-V3.2",
+    "system_prompt": "你是网络流量安全分析助手。请基于结构化告警信息进行场景判断、风险评估和处置建议，不得编造不存在的证据，输出必须是 JSON。",
+    "analyze_every_n": 30,
+    "window_size": 60,
+    "timeout_s": 25.0
+}
